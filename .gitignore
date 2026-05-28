@@ -1,0 +1,59 @@
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node/Vite/Electron dependencies and builds
+node_modules/
+dist/
+out/
+release/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.local
+config.json
+collections.json
+.tensor_config.key
+
+# TSRC/Tensor Serve runtime data
+zim_files/
+zims/
+*.zim
+zim_manifest.json
+presets.json
+*.index
+*.pkl
+*.bm25
+*.faiss
+*.sqlite
+*.sqlite3
+*.db
+
+# Python/Tensor Serve local artifacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+*.egg-info/
+
+# Local scratch/downloads
+tmp/
+temp/
+downloads/
