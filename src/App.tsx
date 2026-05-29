@@ -1,15 +1,24 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import type {
+  BrowserViewBounds,
+  BrowserViewState,
+  NativeDownloadTask,
+  ZimitCaptureRequest,
+} from "./api/tensorServe";
 import {
+  ArrowLeft,
+  ArrowRight,
   Bot,
   ChevronLeft,
   CircleAlert,
   CircleCheck,
   Database,
   Download,
+  ExternalLink,
   File as FileIcon,
-  Files,
   FolderOpen,
   Globe2,
+  Home,
   Loader2,
   MessageSquare,
   PlugZap,
@@ -70,7 +79,7 @@ const createMessage = (role: ChatMessage["role"], content: string): ChatMessage 
   content,
 });
 
-type ActivityId = "chat" | "search" | "downloads" | "files" | "browser" | "databases" | "settings";
+type ActivityId = "chat" | "search" | "downloads" | "browser";
 type SidebarId = "chat" | "serving" | "downloads" | "databases";
 type SettingsSection =
   | "chat"
@@ -91,6 +100,10 @@ type DownloadTask = {
   status: DownloadStatus;
   path?: string;
   error?: string;
+  sourceUrl?: string;
+  receivedBytes?: number;
+  totalBytes?: number;
+  logs?: string[];
 };
 
 const slugifyId = (value: string, fallback: string) => {
@@ -114,6 +127,29 @@ const getDirectoryPath = (filePath: string) => {
   const normalized = filePath.replace(/\\/g, "/");
   const index = normalized.lastIndexOf("/");
   return index > 0 ? normalized.slice(0, index) : "";
+};
+
+const toDownloadTask = (task: NativeDownloadTask): DownloadTask => ({
+  id: task.id,
+  title: task.title,
+  fileName: task.fileName,
+  status: task.status,
+  path: task.path,
+  error: task.error,
+  sourceUrl: task.sourceUrl,
+  receivedBytes: task.receivedBytes,
+  totalBytes: task.totalBytes,
+  logs: task.logs,
+});
+
+const normalizeBrowserUrl = (value: string) => {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+
+  if (/^[a-z][a-z\d+.-]*:/i.test(trimmed)) return trimmed;
+  if (trimmed.includes(".") || trimmed.startsWith("localhost")) return `https://${trimmed}`;
+
+  return `https://www.google.com/search?q=${encodeURIComponent(trimmed)}`;
 };
 
 function App() {
@@ -184,7 +220,31 @@ function App() {
   const [isSettingsMode, setIsSettingsMode] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("chat");
   const [error, setError] = useState<string | null>(null);
+  const [browserUrl, setBrowserUrl] = useState(
+    () => localStorage.getItem("tensor.browserUrl") ?? "https://www.wikipedia.org",
+  );
+  const [browserInput, setBrowserInput] = useState(
+    () => localStorage.getItem("tensor.browserUrl") ?? "https://www.wikipedia.org",
+  );
+  const [browserTitle, setBrowserTitle] = useState("Web browser");
+  const [isBrowserLoading, setIsBrowserLoading] = useState(false);
+  const [browserCanGoBack, setBrowserCanGoBack] = useState(false);
+  const [browserCanGoForward, setBrowserCanGoForward] = useState(false);
+  const [isZimitPanelOpen, setIsZimitPanelOpen] = useState(false);
+  const [zimitName, setZimitName] = useState("");
+  const [zimitOutputDir, setZimitOutputDir] = useState("");
+  const [zimitPageLimit, setZimitPageLimit] = useState("100");
+  const [zimitWorkers, setZimitWorkers] = useState("1");
+  const [zimitWaitUntil, setZimitWaitUntil] = useState("load");
+  const [zimitScopeExclude, setZimitScopeExclude] = useState("");
+  const [zimitKeep, setZimitKeep] = useState(false);
+  const [zimitDisableAdBlocking, setZimitDisableAdBlocking] = useState(false);
+  const [zimitImage, setZimitImage] = useState("ghcr.io/openzim/zimit");
+  const [zimitExtraArgs, setZimitExtraArgs] = useState("");
+  const [zimitStatus, setZimitStatus] = useState("");
+  const [isZimitStarting, setIsZimitStarting] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const browserFrameRef = useRef<HTMLDivElement | null>(null);
 
   const activeModel = model || config?.ai_model || models[0]?.id || "";
   const isConnected = health?.status === "ok";
@@ -195,12 +255,12 @@ function App() {
   const isDatabasePanelOpen = !isSettingsMode && activeSidebar === "databases";
   const isSidebarOpen = !isSettingsMode && activeSidebar !== null;
   const isSearchVisible = !isSettingsMode && activeActivity === "search";
+  const isBrowserVisible = !isSettingsMode && activeActivity === "browser";
   const isDownloadsVisible =
     !isSettingsMode && activeActivity === "downloads" && !isDownloadsPanelOpen;
   const chatNavActive = isSettingsMode ? settingsSection === "chat" : isChatVisible || isChatPanelOpen;
   const searchNavActive = isSettingsMode ? settingsSection === "search" : isSearchVisible;
-  const filesNavActive = isSettingsMode && settingsSection === "files";
-  const browserNavActive = isSettingsMode && settingsSection === "browser";
+  const browserNavActive = isSettingsMode ? settingsSection === "browser" : isBrowserVisible;
   const servingNavActive = isSettingsMode ? settingsSection === "serving" : isServingPanelOpen;
   const downloadsNavActive = isSettingsMode
     ? settingsSection === "downloads"
@@ -225,6 +285,10 @@ function App() {
   );
   const selectedSourceCount = selectedLocalZims.length + selectedCollectionFiles.length;
   const downloadTaskList = useMemo(() => Object.values(downloadTasks), [downloadTasks]);
+  const activeZimitTasks = useMemo(
+    () => downloadTaskList.filter((task) => task.id.startsWith("zimit:")),
+    [downloadTaskList],
+  );
   const modelOptions = useMemo(() => {
     const options = new Map<
       string,
@@ -302,6 +366,118 @@ function App() {
   useEffect(() => {
     if (selectedEndpoint) localStorage.setItem("tensor.endpoint", selectedEndpoint);
   }, [selectedEndpoint]);
+
+  useEffect(() => {
+    localStorage.setItem("tensor.browserUrl", browserUrl);
+  }, [browserUrl]);
+
+  useEffect(() => {
+    const unsubscribe = window.tensorDesktop?.onBrowserViewState?.((state) => {
+      applyBrowserViewState(state);
+    });
+
+    return () => unsubscribe?.();
+  }, []);
+
+  useEffect(() => {
+    const mergeNativeDownloads = (tasks: NativeDownloadTask[]) => {
+      setDownloadTasks((current) => {
+        const next = { ...current };
+        tasks.forEach((task) => {
+          next[task.id] = toDownloadTask(task);
+        });
+        return next;
+      });
+
+      const readyZims = tasks.filter(
+        (task) =>
+          task.status === "ready" &&
+          task.path &&
+          task.fileName.toLowerCase().endsWith(".zim"),
+      );
+
+      if (readyZims.length > 0) {
+        setSelectedLocalZims((current) => {
+          const next = [...current];
+          readyZims.forEach((task) => {
+            if (!task.path || next.some((file) => file.path === task.path)) return;
+            next.push({
+              path: task.path,
+              fileName: task.fileName,
+              sizeBytes: task.totalBytes ?? task.receivedBytes ?? 0,
+            });
+          });
+          return next;
+        });
+      }
+    };
+
+    void window.tensorDesktop?.listNativeDownloads?.().then(mergeNativeDownloads);
+    const unsubscribe = window.tensorDesktop?.onNativeDownloads?.(mergeNativeDownloads);
+
+    return () => unsubscribe?.();
+  }, []);
+
+  useEffect(() => {
+    if (!isZimitPanelOpen || zimitName.trim()) return;
+
+    try {
+      const url = new URL(browserUrl);
+      setZimitName(slugifyId(url.hostname.replace(/^www\./, ""), "website_capture"));
+    } catch {
+      setZimitName("website_capture");
+    }
+  }, [browserUrl, isZimitPanelOpen, zimitName]);
+
+  useEffect(() => {
+    if (!isBrowserVisible || !window.tensorDesktop?.showBrowserView) return;
+
+    let animationFrame = 0;
+    const syncBrowserBounds = () => {
+      window.cancelAnimationFrame(animationFrame);
+      animationFrame = window.requestAnimationFrame(() => {
+        const bounds = getBrowserFrameBounds();
+        if (!bounds) return;
+
+        void window.tensorDesktop?.setBrowserViewBounds?.(bounds);
+      });
+    };
+
+    const showBrowser = () => {
+      const bounds = getBrowserFrameBounds();
+      if (!bounds) return;
+
+      void window.tensorDesktop?.showBrowserView?.({ url: browserUrl, bounds }).then((state) => {
+        applyBrowserViewState(state);
+      });
+    };
+
+    showBrowser();
+
+    const resizeObserver = new ResizeObserver(syncBrowserBounds);
+    if (browserFrameRef.current) resizeObserver.observe(browserFrameRef.current);
+    window.addEventListener("resize", syncBrowserBounds);
+
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      resizeObserver.disconnect();
+      window.removeEventListener("resize", syncBrowserBounds);
+      void window.tensorDesktop?.hideBrowserView?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isBrowserVisible]);
+
+  useEffect(() => {
+    if (!isBrowserVisible || !window.tensorDesktop?.setBrowserViewBounds) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      const bounds = getBrowserFrameBounds();
+      if (bounds) void window.tensorDesktop?.setBrowserViewBounds?.(bounds);
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isBrowserVisible, isZimitPanelOpen]);
 
   useEffect(() => {
     if (localAiEndpoint) localStorage.setItem("tensor.endpoint", localAiEndpoint);
@@ -919,7 +1095,7 @@ function App() {
     }
   }
 
-  function selectActivity(section: "chat" | "search") {
+  function selectActivity(section: "chat" | "search" | "browser") {
     if (isSettingsMode) {
       setSettingsSection(section);
       return;
@@ -955,12 +1131,6 @@ function App() {
     setActiveSidebar(section);
   }
 
-  function selectInactiveSection(section: "files" | "browser") {
-    if (isSettingsMode) {
-      setSettingsSection(section);
-    }
-  }
-
   function toggleSidebar(section: SidebarId) {
     if (isSettingsMode) {
       setSettingsSection(section);
@@ -977,7 +1147,8 @@ function App() {
       } else if (
         activeActivity === "chat" ||
         activeActivity === "search" ||
-        activeActivity === "downloads"
+        activeActivity === "downloads" ||
+        activeActivity === "browser"
       ) {
         setSettingsSection(activeActivity);
       } else {
@@ -997,6 +1168,128 @@ function App() {
     downloads: "Download settings",
     databases: "Vector database settings",
   }[settingsSection];
+
+  function applyBrowserViewState(state?: BrowserViewState | null) {
+    if (!state) return;
+
+    setBrowserUrl(state.url);
+    setBrowserInput(state.url);
+    setBrowserTitle(state.title || "Web browser");
+    setIsBrowserLoading(state.loading);
+    setBrowserCanGoBack(state.canGoBack);
+    setBrowserCanGoForward(state.canGoForward);
+  }
+
+  function getBrowserFrameBounds(): BrowserViewBounds | null {
+    const frame = browserFrameRef.current;
+    if (!frame) return null;
+
+    const rect = frame.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+
+    return {
+      x: rect.x,
+      y: rect.y,
+      width: rect.width,
+      height: rect.height,
+    };
+  }
+
+  function submitBrowserNavigation(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const nextUrl = normalizeBrowserUrl(browserInput);
+    if (!nextUrl) return;
+
+    setBrowserInput(nextUrl);
+    setBrowserUrl(nextUrl);
+    void window.tensorDesktop?.navigateBrowserView?.(nextUrl).then((state) => {
+      applyBrowserViewState(state);
+    });
+  }
+
+  function openBrowserUrlExternally() {
+    if (window.tensorDesktop?.browserOpenExternal) {
+      void window.tensorDesktop.browserOpenExternal(browserUrl);
+      return;
+    }
+
+    window.open(browserUrl, "_blank", "noopener,noreferrer");
+  }
+
+  function getDownloadTaskDetail(task: DownloadTask) {
+    if (task.status === "downloading" && task.totalBytes && task.totalBytes > 0) {
+      const percent = Math.min(100, Math.round(((task.receivedBytes ?? 0) / task.totalBytes) * 100));
+      return `${percent}% of ${formatBytes(task.totalBytes)}`;
+    }
+
+    return task.path ?? task.sourceUrl ?? task.fileName;
+  }
+
+  async function chooseZimitOutputDirectory() {
+    try {
+      const folderPath = await chooseLocalFolder();
+      if (folderPath) setZimitOutputDir(folderPath);
+    } catch (caught) {
+      setZimitStatus(caught instanceof Error ? caught.message : "Unable to choose output folder.");
+    }
+  }
+
+  function zimitNumber(value: string) {
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? number : undefined;
+  }
+
+  async function startZimitCapture() {
+    const seedUrl = normalizeBrowserUrl(browserUrl);
+    if (!seedUrl) {
+      setZimitStatus("Open a website before starting a Zimit capture.");
+      return;
+    }
+
+    if (!window.tensorDesktop?.startZimitCapture) {
+      setZimitStatus("Restart TSRC to enable local Zimit captures.");
+      return;
+    }
+
+    const request: ZimitCaptureRequest = {
+      seedUrl,
+      name: zimitName.trim() || slugifyId(browserTitle, "website_capture"),
+      outputDir: zimitOutputDir.trim() || config?.zim_source_folder?.trim() || undefined,
+      pageLimit: zimitNumber(zimitPageLimit),
+      workers: zimitNumber(zimitWorkers),
+      waitUntil: zimitWaitUntil,
+      scopeExcludeRx: zimitScopeExclude
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean),
+      keep: zimitKeep,
+      disableAdBlocking: zimitDisableAdBlocking,
+      image: zimitImage.trim() || undefined,
+      extraArgs: zimitExtraArgs.trim() || undefined,
+    };
+
+    setIsZimitStarting(true);
+    setZimitStatus("Starting Zimit capture...");
+
+    try {
+      const task = await window.tensorDesktop.startZimitCapture(request);
+      setDownloadTasks((current) => ({ ...current, [task.id]: toDownloadTask(task) }));
+      setZimitStatus("Capture started. Track progress in Downloads.");
+      setIsDownloadListOpen(true);
+      setActiveSidebar("downloads");
+    } catch (caught) {
+      setZimitStatus(caught instanceof Error ? caught.message : "Unable to start Zimit.");
+    } finally {
+      setIsZimitStarting(false);
+    }
+  }
+
+  async function cancelZimitCapture(taskId: string) {
+    const task = await window.tensorDesktop?.cancelZimitCapture?.(taskId);
+    if (task) {
+      setDownloadTasks((current) => ({ ...current, [task.id]: toDownloadTask(task) }));
+    }
+  }
 
   return (
     <main className={`app-shell ${isSidebarOpen ? "sidebar-open" : ""}`}>
@@ -1027,22 +1320,12 @@ function App() {
             <Search size={22} />
           </button>
           <button
-            className={`activity-button ${filesNavActive ? "active" : ""}`}
-            type="button"
-            aria-label="Files"
-            aria-pressed={filesNavActive}
-            title="Files"
-            onClick={() => selectInactiveSection("files")}
-          >
-            <Files size={22} />
-          </button>
-          <button
             className={`activity-button ${browserNavActive ? "active" : ""}`}
             type="button"
             aria-label="Browser"
             aria-pressed={browserNavActive}
             title="Browser"
-            onClick={() => selectInactiveSection("browser")}
+            onClick={() => selectActivity("browser")}
           >
             <Globe2 size={22} />
           </button>
@@ -1357,7 +1640,10 @@ function App() {
                     <article className={`download-task ${task.status}`} key={task.id}>
                       <div>
                         <strong>{task.title}</strong>
-                        <small>{task.path ?? task.fileName}</small>
+                        <small>{getDownloadTaskDetail(task)}</small>
+                        {task.status === "downloading" && task.logs?.at(-1) && (
+                          <small>{task.logs.at(-1)}</small>
+                        )}
                         {task.error && <small>{task.error}</small>}
                       </div>
                       <span className="download-task-status">
@@ -1632,7 +1918,7 @@ function App() {
                       type="button"
                       onClick={() => void chooseLocalDirectory()}
                     >
-                      <Files size={16} />
+                      <FolderOpen size={16} />
                       Choose folder
                     </button>
                   </div>
@@ -1645,7 +1931,7 @@ function App() {
                 <section className="settings-panel">
                   <h3>Browser</h3>
                   <p className="settings-note">
-                    Browser controls will live here when the webview experience is added.
+                    Browser controls use a native Electron page view behind the TSRC toolbar.
                   </p>
                 </section>
               </div>
@@ -1962,7 +2248,10 @@ function App() {
                     <article className={`download-task ${task.status}`} key={task.id}>
                       <div>
                         <strong>{task.title}</strong>
-                        <small>{task.path ?? task.fileName}</small>
+                        <small>{getDownloadTaskDetail(task)}</small>
+                        {task.status === "downloading" && task.logs?.at(-1) && (
+                          <small>{task.logs.at(-1)}</small>
+                        )}
                         {task.error && <small>{task.error}</small>}
                       </div>
                       <span className="download-task-status">
@@ -1976,6 +2265,261 @@ function App() {
                 )}
               </div>
             </aside>
+          </div>
+        </section>
+      )}
+
+      {isBrowserVisible && (
+        <section className="browser-surface" aria-label="Web browser">
+          <header className="browser-toolbar">
+            <div className="browser-nav-controls" aria-label="Browser navigation">
+              <button
+                className="icon-button"
+                type="button"
+                aria-label="Back"
+                title="Back"
+                disabled={!browserCanGoBack}
+                onClick={() =>
+                  window.tensorDesktop?.browserGoBack?.().then((state) => {
+                    applyBrowserViewState(state);
+                  })
+                }
+              >
+                <ArrowLeft size={18} />
+              </button>
+              <button
+                className="icon-button"
+                type="button"
+                aria-label="Forward"
+                title="Forward"
+                disabled={!browserCanGoForward}
+                onClick={() =>
+                  window.tensorDesktop?.browserGoForward?.().then((state) => {
+                    applyBrowserViewState(state);
+                  })
+                }
+              >
+                <ArrowRight size={18} />
+              </button>
+              <button
+                className="icon-button"
+                type="button"
+                aria-label={isBrowserLoading ? "Stop loading" : "Reload"}
+                title={isBrowserLoading ? "Stop loading" : "Reload"}
+                onClick={() =>
+                  isBrowserLoading
+                    ? window.tensorDesktop?.browserStop?.().then((state) => {
+                        applyBrowserViewState(state);
+                      })
+                    : window.tensorDesktop?.browserReload?.().then((state) => {
+                        applyBrowserViewState(state);
+                      })
+                }
+              >
+                {isBrowserLoading ? <Loader2 className="spin" size={18} /> : <RefreshCcw size={18} />}
+              </button>
+              <button
+                className="icon-button"
+                type="button"
+                aria-label="Home"
+                title="Home"
+                onClick={() => {
+                  const homeUrl = "https://www.wikipedia.org";
+                  setBrowserInput(homeUrl);
+                  setBrowserUrl(homeUrl);
+                  void window.tensorDesktop?.navigateBrowserView?.(homeUrl).then((state) => {
+                    applyBrowserViewState(state);
+                  });
+                }}
+              >
+                <Home size={18} />
+              </button>
+            </div>
+
+            <form className="browser-address-form" onSubmit={submitBrowserNavigation}>
+              <Globe2 size={16} aria-hidden="true" />
+              <input
+                value={browserInput}
+                onChange={(event) => setBrowserInput(event.target.value)}
+                aria-label="Address or search"
+                placeholder="Search or enter address"
+              />
+            </form>
+
+            <button
+              className="icon-button"
+              type="button"
+              aria-label="Open externally"
+              title="Open externally"
+              onClick={openBrowserUrlExternally}
+            >
+              <ExternalLink size={18} />
+            </button>
+            <button
+              className={`icon-button ${isZimitPanelOpen ? "active" : ""}`}
+              type="button"
+              aria-label="Save website as ZIM"
+              title="Save website as ZIM"
+              onClick={() => setIsZimitPanelOpen((current) => !current)}
+            >
+              <Download size={18} />
+            </button>
+          </header>
+
+          <div className="browser-titlebar">
+            <span>{browserTitle}</span>
+            <small>{browserUrl}</small>
+          </div>
+
+          {isZimitPanelOpen && (
+            <section className="zimit-panel" aria-label="Zimit capture">
+              <div className="zimit-panel-header">
+                <div>
+                  <strong>Save website as ZIM</strong>
+                  <small>{browserUrl}</small>
+                </div>
+                <button
+                  className="secondary-button compact-button"
+                  type="button"
+                  onClick={() => void startZimitCapture()}
+                  disabled={isZimitStarting}
+                >
+                  {isZimitStarting ? <Loader2 className="spin" size={16} /> : <Download size={16} />}
+                  Start
+                </button>
+              </div>
+
+              <div className="zimit-grid">
+                <label className="field">
+                  <span>ZIM name</span>
+                  <input value={zimitName} onChange={(event) => setZimitName(event.target.value)} />
+                </label>
+                <label className="field">
+                  <span>Page limit</span>
+                  <input
+                    value={zimitPageLimit}
+                    onChange={(event) => setZimitPageLimit(event.target.value)}
+                    inputMode="numeric"
+                  />
+                </label>
+                <label className="field">
+                  <span>Workers</span>
+                  <input
+                    value={zimitWorkers}
+                    onChange={(event) => setZimitWorkers(event.target.value)}
+                    inputMode="numeric"
+                  />
+                </label>
+                <label className="field">
+                  <span>Wait until</span>
+                  <select
+                    value={zimitWaitUntil}
+                    onChange={(event) => setZimitWaitUntil(event.target.value)}
+                  >
+                    <option value="load">load</option>
+                    <option value="domcontentloaded">domcontentloaded</option>
+                    <option value="networkidle0">networkidle0</option>
+                    <option value="networkidle2">networkidle2</option>
+                  </select>
+                </label>
+                <label className="field zimit-output-field">
+                  <span>Output folder</span>
+                  <input
+                    value={zimitOutputDir}
+                    onChange={(event) => setZimitOutputDir(event.target.value)}
+                    placeholder={config?.zim_source_folder || "Downloads/TSRC Zimit"}
+                  />
+                </label>
+                <button
+                  className="secondary-button zimit-folder-button"
+                  type="button"
+                  onClick={() => void chooseZimitOutputDirectory()}
+                >
+                  <FolderOpen size={16} />
+                  Folder
+                </button>
+                <label className="field zimit-wide">
+                  <span>Scope exclude regex, one per line</span>
+                  <textarea
+                    value={zimitScopeExclude}
+                    onChange={(event) => setZimitScopeExclude(event.target.value)}
+                    rows={2}
+                    placeholder="\\?q=&#10;/login"
+                  />
+                </label>
+                <label className="field zimit-wide">
+                  <span>Advanced Zimit / Browsertrix / warc2zim args</span>
+                  <input
+                    value={zimitExtraArgs}
+                    onChange={(event) => setZimitExtraArgs(event.target.value)}
+                    placeholder='--description "Offline site" --lang eng'
+                  />
+                </label>
+                <label className="field">
+                  <span>Docker image</span>
+                  <input value={zimitImage} onChange={(event) => setZimitImage(event.target.value)} />
+                </label>
+                <label className="toggle-field">
+                  <input
+                    type="checkbox"
+                    checked={zimitKeep}
+                    onChange={(event) => setZimitKeep(event.target.checked)}
+                  />
+                  Keep crawl artifacts
+                </label>
+                <label className="toggle-field">
+                  <input
+                    type="checkbox"
+                    checked={zimitDisableAdBlocking}
+                    onChange={(event) => setZimitDisableAdBlocking(event.target.checked)}
+                  />
+                  Disable image ad filtering
+                </label>
+              </div>
+
+              {activeZimitTasks.length > 0 && (
+                <div className="zimit-active-list">
+                  {activeZimitTasks.slice(0, 3).map((task) => (
+                    <article className={`download-task ${task.status}`} key={task.id}>
+                      <div>
+                        <strong>{task.title}</strong>
+                        <small>{getDownloadTaskDetail(task)}</small>
+                        {task.logs?.at(-1) && <small>{task.logs.at(-1)}</small>}
+                        {task.error && <small>{task.error}</small>}
+                      </div>
+                      {task.status === "downloading" ? (
+                        <button
+                          className="secondary-button compact-button"
+                          type="button"
+                          onClick={() => void cancelZimitCapture(task.id)}
+                        >
+                          Cancel
+                        </button>
+                      ) : (
+                        <span className="download-task-status">
+                          {task.status === "ready" ? <CircleCheck size={14} /> : <CircleAlert size={14} />}
+                          {task.status}
+                        </span>
+                      )}
+                    </article>
+                  ))}
+                </div>
+              )}
+
+              {zimitStatus && <p className="vector-status">{zimitStatus}</p>}
+            </section>
+          )}
+
+          <div className="browser-frame" ref={browserFrameRef}>
+            {window.tensorDesktop?.showBrowserView ? (
+              <div className="native-browser-placeholder" aria-hidden="true" />
+            ) : (
+              <iframe
+                src={browserUrl}
+                title={browserTitle}
+                sandbox="allow-forms allow-scripts allow-same-origin allow-popups"
+              />
+            )}
           </div>
         </section>
       )}
@@ -2146,7 +2690,7 @@ function App() {
                       type="button"
                       onClick={() => void chooseLocalDirectory()}
                     >
-                      <Files size={16} />
+                      <FolderOpen size={16} />
                       Choose folder
                     </button>
                   </div>

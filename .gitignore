@@ -7,6 +7,7 @@
 
 # Node/Vite/Electron dependencies and builds
 node_modules/
+package-lock.json
 dist/
 out/
 release/

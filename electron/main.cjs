@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, shell } = require("electron");
+const { app, BrowserView, BrowserWindow, dialog, ipcMain, shell } = require("electron");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const { mkdir } = require("node:fs/promises");
@@ -11,6 +11,22 @@ const devServerUrl = process.env.VITE_DEV_SERVER_URL ?? "http://127.0.0.1:5173";
 let tensorServeProcess = null;
 let tensorServeExit = null;
 const tensorServeLogs = [];
+let mainWindow = null;
+let browserView = null;
+const browserState = {
+  url: "https://www.wikipedia.org",
+  title: "Web browser",
+  loading: false,
+  canGoBack: false,
+  canGoForward: false,
+};
+const nativeDownloadTasks = new Map();
+const zimitTasks = new Map();
+const zimitProcesses = new Map();
+const downloadSessions = new WeakSet();
+const DESKTOP_BROWSER_USER_AGENT =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const ZIMIT_IMAGE = "ghcr.io/openzim/zimit";
 
 function addTensorServeLog(chunk) {
   const line = String(chunk ?? "").trim();
@@ -30,6 +46,262 @@ function getTensorServeStatus() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function sanitizeBrowserBounds(bounds = {}) {
+  return {
+    x: Math.max(0, Math.round(Number(bounds.x) || 0)),
+    y: Math.max(0, Math.round(Number(bounds.y) || 0)),
+    width: Math.max(0, Math.round(Number(bounds.width) || 0)),
+    height: Math.max(0, Math.round(Number(bounds.height) || 0)),
+  };
+}
+
+function sendBrowserState() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("browser-view:state", { ...browserState });
+}
+
+function sendDownloadState() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("downloads:state", [
+    ...nativeDownloadTasks.values(),
+    ...zimitTasks.values(),
+  ]);
+}
+
+function getUniqueDownloadPath(fileName) {
+  const downloadsDirectory = app.getPath("downloads");
+  const parsed = path.parse(fileName || "download");
+  const baseName = parsed.name || "download";
+  const extension = parsed.ext || "";
+  let candidate = path.join(downloadsDirectory, `${baseName}${extension}`);
+  let index = 1;
+
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(downloadsDirectory, `${baseName} (${index})${extension}`);
+    index += 1;
+  }
+
+  return candidate;
+}
+
+function splitCommandArgs(value) {
+  const args = [];
+  let current = "";
+  let quote = "";
+  let escaped = false;
+
+  for (const char of String(value ?? "")) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+
+    if (quote) {
+      if (char === quote) {
+        quote = "";
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (current) {
+        args.push(current);
+        current = "";
+      }
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (current) args.push(current);
+  return args;
+}
+
+function toSafeZimName(value, fallback = "website-capture") {
+  return String(value || fallback)
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/[^a-z0-9._-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80) || fallback;
+}
+
+function newestZimFile(outputDir, startedAtMs, preferredName) {
+  const files = findZimFiles(outputDir)
+    .map((file) => ({
+      ...file,
+      mtimeMs: fs.statSync(file.path).mtimeMs,
+    }))
+    .filter((file) => file.mtimeMs >= startedAtMs - 2000)
+    .sort((left, right) => {
+      const leftPreferred = left.fileName.includes(preferredName) ? 1 : 0;
+      const rightPreferred = right.fileName.includes(preferredName) ? 1 : 0;
+      if (leftPreferred !== rightPreferred) return rightPreferred - leftPreferred;
+      return right.mtimeMs - left.mtimeMs;
+    });
+
+  return files[0] ?? null;
+}
+
+function updateZimitTask(id, patch) {
+  const existing = zimitTasks.get(id);
+  if (!existing) return;
+  zimitTasks.set(id, { ...existing, ...patch });
+  sendDownloadState();
+}
+
+function appendZimitLog(id, chunk) {
+  const text = String(chunk ?? "").trim();
+  if (!text) return;
+  const existing = zimitTasks.get(id);
+  if (!existing) return;
+  const logs = [...(existing.logs ?? []), ...text.split(/\r?\n/).filter(Boolean)].slice(-18);
+  zimitTasks.set(id, { ...existing, logs });
+  sendDownloadState();
+}
+
+async function stopZimitTask(id) {
+  const processInfo = zimitProcesses.get(id);
+  if (!processInfo) return;
+
+  updateZimitTask(id, { status: "failed", error: "Capture cancelled." });
+
+  try {
+    if (processInfo.containerName) {
+      spawn("docker", ["stop", processInfo.containerName], { stdio: "ignore" });
+    }
+  } catch {
+    // The container may already be gone.
+  }
+
+  try {
+    processInfo.process.kill("SIGTERM");
+  } catch {
+    // The docker process may already be gone.
+  }
+}
+
+function watchDownloads(session) {
+  if (!session || downloadSessions.has(session)) return;
+  downloadSessions.add(session);
+
+  session.on("will-download", (_event, item) => {
+    const id = `web:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    const fileName = item.getFilename() || "download";
+    const destination = getUniqueDownloadPath(fileName);
+    item.setSavePath(destination);
+
+    nativeDownloadTasks.set(id, {
+      id,
+      title: fileName,
+      fileName,
+      path: destination,
+      status: "downloading",
+      sourceUrl: item.getURL(),
+      receivedBytes: item.getReceivedBytes(),
+      totalBytes: item.getTotalBytes(),
+    });
+    sendDownloadState();
+
+    item.on("updated", (_updateEvent, state) => {
+      const task = nativeDownloadTasks.get(id);
+      if (!task) return;
+
+      nativeDownloadTasks.set(id, {
+        ...task,
+        status: state === "interrupted" ? "failed" : "downloading",
+        error: state === "interrupted" ? "Download interrupted." : undefined,
+        receivedBytes: item.getReceivedBytes(),
+        totalBytes: item.getTotalBytes(),
+      });
+      sendDownloadState();
+    });
+
+    item.once("done", (_doneEvent, state) => {
+      const task = nativeDownloadTasks.get(id);
+      if (!task) return;
+
+      nativeDownloadTasks.set(id, {
+        ...task,
+        status: state === "completed" ? "ready" : "failed",
+        error: state === "completed" ? undefined : `Download ${state}.`,
+        receivedBytes: item.getReceivedBytes(),
+        totalBytes: item.getTotalBytes(),
+        path: item.getSavePath() || destination,
+      });
+      sendDownloadState();
+    });
+  });
+}
+
+function updateBrowserState(patch = {}) {
+  Object.assign(browserState, patch);
+
+  if (browserView && !browserView.webContents.isDestroyed()) {
+    browserState.canGoBack = browserView.webContents.canGoBack();
+    browserState.canGoForward = browserView.webContents.canGoForward();
+    browserState.url = browserView.webContents.getURL() || browserState.url;
+  }
+
+  sendBrowserState();
+}
+
+function createBrowserView() {
+  if (browserView) return browserView;
+
+  browserView = new BrowserView({
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+
+  browserView.webContents.setUserAgent(DESKTOP_BROWSER_USER_AGENT);
+  watchDownloads(browserView.webContents.session);
+  browserView.webContents.setWindowOpenHandler(({ url }) => {
+    shell.openExternal(url);
+    return { action: "deny" };
+  });
+
+  browserView.webContents.on("did-start-loading", () => updateBrowserState({ loading: true }));
+  browserView.webContents.on("did-stop-loading", () => {
+    updateBrowserState({
+      loading: false,
+      title: browserView.webContents.getTitle() || browserState.title,
+    });
+  });
+  browserView.webContents.on("did-navigate", (_event, url) => updateBrowserState({ url }));
+  browserView.webContents.on("did-navigate-in-page", (_event, url) => updateBrowserState({ url }));
+  browserView.webContents.on("page-title-updated", (_event, title) => {
+    updateBrowserState({ title });
+  });
+  browserView.webContents.on("did-fail-load", (_event, _code, description, url) => {
+    updateBrowserState({
+      loading: false,
+      url: url || browserState.url,
+      title: description || browserState.title,
+    });
+  });
+
+  return browserView;
 }
 
 async function stopHostedTensorServe() {
@@ -76,7 +348,7 @@ async function stopHostedTensorServe() {
 }
 
 function createWindow() {
-  const mainWindow = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 1240,
     height: 820,
     minWidth: 920,
@@ -113,7 +385,209 @@ function createWindow() {
     shell.openExternal(url);
     return { action: "deny" };
   });
+
+  mainWindow.on("closed", () => {
+    for (const id of zimitProcesses.keys()) {
+      void stopZimitTask(id);
+    }
+    browserView?.webContents.destroy();
+    browserView = null;
+    mainWindow = null;
+  });
 }
+
+ipcMain.handle("browser-view:show", async (_event, request = {}) => {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    throw new Error("Browser window is not ready.");
+  }
+
+  const view = createBrowserView();
+  const bounds = sanitizeBrowserBounds(request.bounds);
+
+  if (bounds.width > 0 && bounds.height > 0) {
+    view.setBounds(bounds);
+    view.setAutoResize({ width: true, height: true });
+  }
+
+  mainWindow.setBrowserView(view);
+
+  const requestedUrl = String(request.url ?? browserState.url).trim();
+  if (requestedUrl && requestedUrl !== view.webContents.getURL()) {
+    browserState.url = requestedUrl;
+    await view.webContents.loadURL(requestedUrl);
+  }
+
+  updateBrowserState();
+  return { ...browserState };
+});
+
+ipcMain.handle("browser-view:set-bounds", async (_event, bounds) => {
+  if (!browserView) return { ...browserState };
+
+  const nextBounds = sanitizeBrowserBounds(bounds);
+  if (nextBounds.width > 0 && nextBounds.height > 0) {
+    browserView.setBounds(nextBounds);
+  }
+
+  return { ...browserState };
+});
+
+ipcMain.handle("browser-view:hide", async () => {
+  if (mainWindow && browserView && !mainWindow.isDestroyed()) {
+    mainWindow.removeBrowserView(browserView);
+  }
+
+  return { ...browserState };
+});
+
+ipcMain.handle("browser-view:navigate", async (_event, url) => {
+  const view = createBrowserView();
+  const nextUrl = String(url ?? "").trim();
+  if (!nextUrl) return { ...browserState };
+
+  browserState.url = nextUrl;
+  await view.webContents.loadURL(nextUrl);
+  updateBrowserState();
+  return { ...browserState };
+});
+
+ipcMain.handle("browser-view:back", async () => {
+  if (browserView?.webContents.canGoBack()) browserView.webContents.goBack();
+  updateBrowserState();
+  return { ...browserState };
+});
+
+ipcMain.handle("browser-view:forward", async () => {
+  if (browserView?.webContents.canGoForward()) browserView.webContents.goForward();
+  updateBrowserState();
+  return { ...browserState };
+});
+
+ipcMain.handle("browser-view:reload", async () => {
+  browserView?.webContents.reload();
+  updateBrowserState();
+  return { ...browserState };
+});
+
+ipcMain.handle("browser-view:stop", async () => {
+  browserView?.webContents.stop();
+  updateBrowserState({ loading: false });
+  return { ...browserState };
+});
+
+ipcMain.handle("browser-view:open-external", async (_event, url) => {
+  const targetUrl = String(url ?? browserState.url).trim();
+  if (targetUrl) await shell.openExternal(targetUrl);
+  return { ...browserState };
+});
+
+ipcMain.handle("downloads:list-native", async () => {
+  return [...nativeDownloadTasks.values(), ...zimitTasks.values()];
+});
+
+ipcMain.handle("zimit:start", async (_event, request = {}) => {
+  const seedUrl = String(request.seedUrl ?? browserState.url ?? "").trim();
+  if (!seedUrl) throw new Error("Choose a website URL to capture.");
+
+  const outputDir = String(request.outputDir ?? "").trim() || path.join(app.getPath("downloads"), "TSRC Zimit");
+  await mkdir(outputDir, { recursive: true });
+
+  if (!fs.existsSync(outputDir) || !fs.statSync(outputDir).isDirectory()) {
+    throw new Error("Choose a valid Zimit output folder.");
+  }
+
+  const id = `zimit:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  const name = toSafeZimName(request.name, new URL(seedUrl).hostname || "website-capture");
+  const containerName = `tsrc-zimit-${id.replace(/[^a-z0-9_-]/gi, "-")}`;
+  const startedAtMs = Date.now();
+  const args = [
+    "run",
+    "--rm",
+    "--name",
+    containerName,
+    "--shm-size=1gb",
+    "-v",
+    `${outputDir}:/output`,
+  ];
+
+  if (request.disableAdBlocking) {
+    args.push("--entrypoint", "");
+  }
+
+  args.push(String(request.image || ZIMIT_IMAGE), "zimit", "--seeds", seedUrl, "--name", name, "--output", "/output");
+
+  if (request.pageLimit) args.push("--pageLimit", String(request.pageLimit));
+  if (request.workers) args.push("--workers", String(request.workers));
+  if (request.waitUntil) args.push("--waitUntil", String(request.waitUntil));
+  if (request.keep) args.push("--keep");
+
+  for (const pattern of request.scopeExcludeRx ?? []) {
+    const trimmed = String(pattern ?? "").trim();
+    if (trimmed) args.push("--scopeExcludeRx", trimmed);
+  }
+
+  args.push(...splitCommandArgs(request.extraArgs));
+
+  zimitTasks.set(id, {
+    id,
+    title: `Zimit: ${name}`,
+    fileName: `${name}.zim`,
+    status: "downloading",
+    path: outputDir,
+    sourceUrl: seedUrl,
+    receivedBytes: 0,
+    logs: [`docker ${args.join(" ")}`],
+  });
+  sendDownloadState();
+
+  const dockerProcess = spawn("docker", args, {
+    cwd: outputDir,
+    env: process.env,
+  });
+
+  zimitProcesses.set(id, { process: dockerProcess, containerName });
+
+  dockerProcess.stdout?.on("data", (chunk) => appendZimitLog(id, chunk));
+  dockerProcess.stderr?.on("data", (chunk) => appendZimitLog(id, chunk));
+  dockerProcess.on("error", (error) => {
+    zimitProcesses.delete(id);
+    updateZimitTask(id, {
+      status: "failed",
+      error:
+        error.code === "ENOENT"
+          ? "Docker was not found. Install or start Docker Desktop, then try again."
+          : error.message,
+    });
+  });
+  dockerProcess.on("exit", (code, signal) => {
+    zimitProcesses.delete(id);
+
+    if (code === 0) {
+      const zimFile = newestZimFile(outputDir, startedAtMs, name);
+      updateZimitTask(id, {
+        status: zimFile ? "ready" : "failed",
+        path: zimFile?.path ?? outputDir,
+        fileName: zimFile?.fileName ?? `${name}.zim`,
+        error: zimFile ? undefined : "Zimit finished, but no new ZIM file was found.",
+        receivedBytes: zimFile?.sizeBytes,
+        totalBytes: zimFile?.sizeBytes,
+      });
+      return;
+    }
+
+    updateZimitTask(id, {
+      status: "failed",
+      error: signal ? `Zimit stopped with ${signal}.` : `Zimit exited with code ${code}.`,
+    });
+  });
+
+  return zimitTasks.get(id);
+});
+
+ipcMain.handle("zimit:cancel", async (_event, id) => {
+  await stopZimitTask(String(id ?? ""));
+  return zimitTasks.get(String(id ?? "")) ?? null;
+});
 
 ipcMain.handle("tensor:request", async (_event, request) => {
   const baseUrl = String(request.baseUrl ?? "").replace(/\/+$/, "");

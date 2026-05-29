@@ -1,62 +1,97 @@
 # TSRC
 
-Tensor Serve RAG Client is the first step toward a tensor-powered local AI
-desktop workspace. This version is a focused Electron chat client for
-[`tensor-serve`](https://github.com/3M1RY33T/tensor-serve), which exposes an
-OpenAI-compatible `/v1/chat/completions` endpoint.
+| *> Overview <* | [Run](#run) | [Browser And ZIM Capture](#browser-and-zim-capture) | [Credits](#credits) |
+| --- | --- | --- | --- |
 
-## Why This Stack
+`TSRC` is a local desktop workspace for browsing, saving, indexing, and chatting with offline knowledge sources. It connects to [`tensor-serve`](https://github.com/3M1RY33T/tensor-serve), lets you work with local ZIM files, and helps turn those files into vector databases for local retrieval-augmented chat.
 
-The long-term app wants a code editor, an embedded browser/webview, local
-indexing workflows, and an agentic UI. The current foundation uses Electron,
-Vite, React, and TypeScript because Electron gives us the desktop runtime,
-Chromium webviews, local filesystem integration, and future automation hooks,
-while React/Vite keep the app interface fast to build.
+The app is built with Electron, React, Vite, and TypeScript. Electron provides the desktop shell, local filesystem access, native browser view, downloads, and Docker-backed website capture. React and Vite keep the interface fast to develop.
+
+## What It Does
+
+- Connects to a configurable Tensor Serve endpoint.
+- Runs local chat against an OpenAI-compatible `/v1/chat/completions` API.
+- Shows Tensor Serve health, model, vector database, and collection status.
+- Browses local folders for `.zim` archives.
+- Searches and downloads ZIM files from the Kiwix/openZIM catalog.
+- Opens websites in an embedded desktop browser.
+- Saves websites as `.zim` files with Zimit.
+- Tracks Kiwix, browser, and Zimit downloads in one Downloads view.
+- Builds or loads local vector databases from selected ZIM files.
 
 ## Run
 
-Start Tensor Serve first:
-
-```bash
-tensor-serve start
-```
-
-Then run the desktop app:
+Install dependencies:
 
 ```bash
 npm install
+```
+
+Start Tensor Serve:
+
+```bash
+tensor-serve start --host 127.0.0.1 --port 8000
+```
+
+Run the desktop app:
+
+```bash
 npm run dev
 ```
 
-Electron will open the TSRC application window.
-
-For renderer-only debugging in a browser:
+For renderer-only browser debugging:
 
 ```bash
 npm run web:dev
 ```
 
-During browser debugging the app defaults to `/tensor`, a Vite proxy for
-`http://localhost:8000`. To point that proxy at another Tensor Serve URL:
+Build the app:
 
 ```bash
-VITE_TENSOR_SERVE_URL=http://localhost:3000 npm run web:dev
+npm run build
 ```
 
-## Current Features
+## Browser And ZIM Capture
 
-- Connects to a configurable Tensor Serve base URL, defaulting to
-  `http://localhost:8000`
-- Runs as an Electron desktop application
-- Checks `/health` and `/config`
-- Reads models from `/v1/models` when available
-- Sends chat requests to `/v1/chat/completions`
-- Shows Tensor Serve AI, vector DB, and active collection status
+Open the Browser activity, visit a website, and use the save/download control to create a ZIM archive with Zimit. Zimit runs through Docker using the `ghcr.io/openzim/zimit` image, so Docker Desktop must be installed and running.
 
-## Next Steps
+The capture panel supports common Zimit options such as:
 
-- Add streaming chat responses when Tensor Serve exposes stream passthrough
-- Add Electron shell and native window controls
-- Add Monaco editor workspace panes
-- Add browser/webview tabs
-- Add ZIM scrape, archive, ingestion, and collection management workflows
+- ZIM name
+- output folder
+- page limit
+- worker count
+- `waitUntil`
+- scope exclude regexes
+- keeping crawl artifacts
+- disabling the image entrypoint ad filtering
+- advanced passthrough arguments for Zimit, Browsertrix, and warc2zim
+
+Completed `.zim` captures are added to the local ZIM selection flow so they can be used to create a vector database.
+
+## Downloads
+
+The Downloads section tracks:
+
+- ZIM files downloaded from the Kiwix/openZIM catalog
+- regular files downloaded from the embedded browser
+- Zimit website capture jobs
+
+Download rows show status, file path or source URL, and progress details when available.
+
+## Credits
+
+TSRC builds on work from the open knowledge and offline web ecosystem:
+
+- [openZIM](https://openzim.org/) for the ZIM file format and tooling.
+- [Kiwix](https://www.kiwix.org/) for offline knowledge access and the public ZIM catalog.
+- [openzim/zimit](https://github.com/openzim/zimit) for website-to-ZIM capture. Zimit uses Browsertrix Crawler to crawl websites and warc2zim to produce ZIM archives.
+- [tensor-serve](https://github.com/3M1RY33T/tensor-serve) for local AI, ingestion, and vector database workflows.
+
+ZIM files and captured website content belong to their original publishers and should be used according to their licenses and terms.
+
+## Development Notes
+
+Main process code lives in `electron/`. The React app lives in `src/`.
+
+When changing Electron main or preload code, fully restart the desktop app. Vite hot module reload only updates the renderer.

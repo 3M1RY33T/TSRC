@@ -151,6 +151,48 @@ export type TensorServeProcessStatus = {
   logs: string[];
 };
 
+export type BrowserViewBounds = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+export type BrowserViewState = {
+  url: string;
+  title: string;
+  loading: boolean;
+  canGoBack: boolean;
+  canGoForward: boolean;
+};
+
+export type NativeDownloadTask = {
+  id: string;
+  title: string;
+  fileName: string;
+  status: "downloading" | "ready" | "failed";
+  path?: string;
+  error?: string;
+  sourceUrl?: string;
+  receivedBytes?: number;
+  totalBytes?: number;
+  logs?: string[];
+};
+
+export type ZimitCaptureRequest = {
+  seedUrl: string;
+  name: string;
+  outputDir?: string;
+  pageLimit?: number;
+  workers?: number;
+  waitUntil?: string;
+  scopeExcludeRx?: string[];
+  keep?: boolean;
+  disableAdBlocking?: boolean;
+  image?: string;
+  extraArgs?: string;
+};
+
 declare global {
   interface Window {
     tensorDesktop?: {
@@ -181,6 +223,23 @@ declare global {
       getLocalHomeDirectory?: () => Promise<string>;
       getLocalDownloadsDirectory?: () => Promise<string>;
       listVectorDatabases?: (request: { roots?: string[] }) => Promise<VectorDatabaseSummary[]>;
+      showBrowserView?: (request: {
+        url: string;
+        bounds: BrowserViewBounds;
+      }) => Promise<BrowserViewState>;
+      setBrowserViewBounds?: (bounds: BrowserViewBounds) => Promise<BrowserViewState>;
+      hideBrowserView?: () => Promise<BrowserViewState>;
+      navigateBrowserView?: (url: string) => Promise<BrowserViewState>;
+      browserGoBack?: () => Promise<BrowserViewState>;
+      browserGoForward?: () => Promise<BrowserViewState>;
+      browserReload?: () => Promise<BrowserViewState>;
+      browserStop?: () => Promise<BrowserViewState>;
+      browserOpenExternal?: (url: string) => Promise<BrowserViewState>;
+      onBrowserViewState?: (callback: (state: BrowserViewState) => void) => () => void;
+      listNativeDownloads?: () => Promise<NativeDownloadTask[]>;
+      onNativeDownloads?: (callback: (tasks: NativeDownloadTask[]) => void) => () => void;
+      startZimitCapture?: (request: ZimitCaptureRequest) => Promise<NativeDownloadTask>;
+      cancelZimitCapture?: (id: string) => Promise<NativeDownloadTask | null>;
     };
   }
 }
