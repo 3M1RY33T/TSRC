@@ -59,6 +59,55 @@ export type DownloadedZim = {
   sourceUrl: string;
 };
 
+export type LocalZimFile = {
+  path: string;
+  fileName: string;
+  sizeBytes: number;
+};
+
+export type LocalBrowserEntry = {
+  type: "directory" | "zim";
+  name: string;
+  path: string;
+  sizeBytes?: number;
+};
+
+export type LocalDirectoryListing = {
+  currentPath: string;
+  parentPath: string | null;
+  entries: LocalBrowserEntry[];
+};
+
+export type VectorDatabaseSummary = {
+  name: string;
+  path: string;
+  hasBm25: boolean;
+  sizeBytes: number;
+  updatedMs: number;
+};
+
+export type TensorCollectionSummary = {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  path: string | null;
+  file_count: number;
+};
+
+export type TensorCollectionFile = {
+  name: string;
+  path: string;
+  size?: string | null;
+  installed?: boolean;
+  needs_download?: boolean;
+};
+
+export type TensorCollectionDetails = TensorCollectionSummary & {
+  files?: TensorCollectionFile[];
+  zim_files?: TensorCollectionFile[];
+};
+
 export type ChatRole = "system" | "user" | "assistant";
 
 export type ChatMessage = {
@@ -95,10 +144,23 @@ type DesktopTensorResponse = {
   body: string;
 };
 
+export type TensorServeProcessStatus = {
+  running: boolean;
+  pid: number | null;
+  exitCode: number | null;
+  logs: string[];
+};
+
 declare global {
   interface Window {
     tensorDesktop?: {
       request: (request: DesktopTensorRequest) => Promise<DesktopTensorResponse>;
+      tensorServeStatus?: () => Promise<TensorServeProcessStatus>;
+      startTensorServe?: (request: {
+        command: string;
+        cwd?: string;
+      }) => Promise<TensorServeProcessStatus>;
+      stopTensorServe?: () => Promise<TensorServeProcessStatus>;
       kiwixCatalog?: (request: {
         query?: string;
         language?: string;
@@ -110,9 +172,41 @@ declare global {
         downloadUrl: string;
         name: string;
         sizeBytes?: number;
+        downloadDir?: string;
       }) => Promise<DownloadedZim>;
+      browseLocalZims?: () => Promise<LocalZimFile[]>;
+      browseLocalZimFolder?: () => Promise<{ folderPath: string; files: LocalZimFile[] }>;
+      chooseLocalFolder?: () => Promise<string | null>;
+      listLocalDirectory?: (folderPath: string) => Promise<LocalDirectoryListing>;
+      getLocalHomeDirectory?: () => Promise<string>;
+      getLocalDownloadsDirectory?: () => Promise<string>;
+      listVectorDatabases?: (request: { roots?: string[] }) => Promise<VectorDatabaseSummary[]>;
     };
   }
+}
+
+export async function getTensorServeProcessStatus() {
+  if (!window.tensorDesktop?.tensorServeStatus) {
+    return { running: false, pid: null, exitCode: null, logs: [] };
+  }
+
+  return window.tensorDesktop.tensorServeStatus();
+}
+
+export async function startTensorServe(command: string, cwd?: string) {
+  if (!window.tensorDesktop?.startTensorServe) {
+    throw new Error("Restart TSRC to enable Tensor Serve hosting.");
+  }
+
+  return window.tensorDesktop.startTensorServe({ command, cwd });
+}
+
+export async function stopTensorServe() {
+  if (!window.tensorDesktop?.stopTensorServe) {
+    throw new Error("Restart TSRC to enable Tensor Serve hosting.");
+  }
+
+  return window.tensorDesktop.stopTensorServe();
 }
 
 const trimTrailingSlash = (value: string) => value.replace(/\/+$/, "");
@@ -270,7 +364,7 @@ export async function searchKiwixCatalog(params: {
   return parseKiwixCatalogXml(xml);
 }
 
-export async function downloadZim(entry: KiwixCatalogEntry) {
+export async function downloadZim(entry: KiwixCatalogEntry, downloadDir?: string | null) {
   if (!window.tensorDesktop?.downloadZim) {
     throw new Error("Restart TSRC to enable desktop ZIM downloads.");
   }
@@ -279,7 +373,64 @@ export async function downloadZim(entry: KiwixCatalogEntry) {
     downloadUrl: entry.downloadUrl,
     name: entry.name,
     sizeBytes: entry.sizeBytes,
+    downloadDir: downloadDir?.trim() || undefined,
   });
+}
+
+export async function browseLocalZims() {
+  if (!window.tensorDesktop?.browseLocalZims) {
+    throw new Error("Restart TSRC to enable local ZIM file browsing.");
+  }
+
+  return window.tensorDesktop.browseLocalZims();
+}
+
+export async function browseLocalZimFolder() {
+  if (!window.tensorDesktop?.browseLocalZimFolder) {
+    throw new Error("Restart TSRC to enable local folder browsing.");
+  }
+
+  return window.tensorDesktop.browseLocalZimFolder();
+}
+
+export async function chooseLocalFolder() {
+  if (!window.tensorDesktop?.chooseLocalFolder) {
+    throw new Error("Restart TSRC to enable local folder browsing.");
+  }
+
+  return window.tensorDesktop.chooseLocalFolder();
+}
+
+export async function listLocalDirectory(folderPath: string) {
+  if (!window.tensorDesktop?.listLocalDirectory) {
+    throw new Error("Restart TSRC to enable local folder browsing.");
+  }
+
+  return window.tensorDesktop.listLocalDirectory(folderPath);
+}
+
+export async function getLocalHomeDirectory() {
+  if (!window.tensorDesktop?.getLocalHomeDirectory) {
+    throw new Error("Restart TSRC to enable local folder browsing.");
+  }
+
+  return window.tensorDesktop.getLocalHomeDirectory();
+}
+
+export async function getLocalDownloadsDirectory() {
+  if (!window.tensorDesktop?.getLocalDownloadsDirectory) {
+    throw new Error("Restart TSRC to enable local folder browsing.");
+  }
+
+  return window.tensorDesktop.getLocalDownloadsDirectory();
+}
+
+export async function listVectorDatabases(roots: string[] = []) {
+  if (!window.tensorDesktop?.listVectorDatabases) {
+    throw new Error("Restart TSRC to enable vector database discovery.");
+  }
+
+  return window.tensorDesktop.listVectorDatabases({ roots });
 }
 
 export async function registerZim(baseUrl: string, zimPath: string, entry?: KiwixCatalogEntry) {
@@ -314,6 +465,35 @@ export async function createCollection(
 export async function ingestCollection(baseUrl: string, collectionId: string) {
   return requestJson(baseUrl, `/collections/${encodeURIComponent(collectionId)}/ingest`, {
     method: "POST",
+  });
+}
+
+export async function listCollections(baseUrl: string) {
+  const response = await requestJson<{
+    collections?: Record<string, Omit<TensorCollectionSummary, "id">>;
+    active?: string | null;
+  }>(baseUrl, "/collections");
+
+  return Object.entries(response.collections ?? {}).map(([id, collection]) => ({
+    id,
+    ...collection,
+  }));
+}
+
+export async function getCollectionDetails(baseUrl: string, collectionId: string) {
+  return requestJson<TensorCollectionDetails>(
+    baseUrl,
+    `/collections/${encodeURIComponent(collectionId)}`,
+  );
+}
+
+export async function ingestMultiple(baseUrl: string, zimPaths: string[], outputName: string) {
+  return requestJson(baseUrl, "/ingest-multiple", {
+    method: "POST",
+    body: JSON.stringify({
+      zim_paths: zimPaths,
+      output_name: outputName,
+    }),
   });
 }
 
