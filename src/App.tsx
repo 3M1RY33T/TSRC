@@ -1,4 +1,5 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, MouseEvent, useEffect, useMemo, useRef, useState } from "react";
+import openZimLogo from "./assets/openzim-logo.svg";
 import type {
   BrowserViewBounds,
   BrowserViewState,
@@ -22,6 +23,7 @@ import {
   Loader2,
   MessageSquare,
   PlugZap,
+  Plus,
   RefreshCcw,
   Search,
   Send,
@@ -72,6 +74,7 @@ const DEFAULT_TENSOR_SERVE_URL = window.tensorDesktop
     ? "/tensor"
     : "http://localhost:8000";
 const DEFAULT_TENSOR_SERVE_COMMAND = "tensor-serve start --host 127.0.0.1 --port 8000";
+const DEFAULT_BROWSER_HOME_URL = "https://www.wikipedia.org";
 
 const createMessage = (role: ChatMessage["role"], content: string): ChatMessage => ({
   id: crypto.randomUUID(),
@@ -80,7 +83,8 @@ const createMessage = (role: ChatMessage["role"], content: string): ChatMessage 
 });
 
 type ActivityId = "chat" | "search" | "downloads" | "browser";
-type SidebarId = "chat" | "serving" | "downloads" | "databases";
+type SidebarId = "chat" | "search" | "serving" | "downloads" | "databases";
+type SidebarCapableActivityId = Extract<ActivityId, SidebarId>;
 type SettingsSection =
   | "chat"
   | "search"
@@ -89,9 +93,10 @@ type SettingsSection =
   | "serving"
   | "downloads"
   | "databases";
-type VectorSource = "local" | "collections";
+type VectorSource = "local" | "collections" | "archive";
 type VectorSetupMode = "database" | "collection";
 type DownloadStatus = "downloading" | "ready" | "failed";
+type VectorProgressStatus = "working" | "ready" | "failed";
 
 type DownloadTask = {
   id: string;
@@ -104,6 +109,15 @@ type DownloadTask = {
   receivedBytes?: number;
   totalBytes?: number;
   logs?: string[];
+};
+
+type VectorProgress = {
+  label: string;
+  detail?: string;
+  current?: number;
+  total?: number;
+  indeterminate?: boolean;
+  status: VectorProgressStatus;
 };
 
 const slugifyId = (value: string, fallback: string) => {
@@ -128,6 +142,8 @@ const getDirectoryPath = (filePath: string) => {
   const index = normalized.lastIndexOf("/");
   return index > 0 ? normalized.slice(0, index) : "";
 };
+
+const normalizePathId = (value?: string | null) => (value ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
 
 const toDownloadTask = (task: NativeDownloadTask): DownloadTask => ({
   id: task.id,
@@ -197,6 +213,9 @@ function App() {
   const [availableCollections, setAvailableCollections] = useState<TensorCollectionSummary[]>([]);
   const [selectedCollections, setSelectedCollections] = useState<TensorCollectionDetails[]>([]);
   const [vectorDatabases, setVectorDatabases] = useState<VectorDatabaseSummary[]>([]);
+  const [activeVectorDbPath, setActiveVectorDbPath] = useState(
+    () => localStorage.getItem("tensor.activeVectorDbPath") ?? "",
+  );
   const [downloadedZims, setDownloadedZims] = useState<Record<string, DownloadedZim>>({});
   const [downloadTasks, setDownloadTasks] = useState<Record<string, DownloadTask>>({});
   const [isDownloadListOpen, setIsDownloadListOpen] = useState(true);
@@ -212,6 +231,7 @@ function App() {
   const [isCollectionsLoading, setIsCollectionsLoading] = useState(false);
   const [isVectorDbLoading, setIsVectorDbLoading] = useState(false);
   const [isVectorWorking, setIsVectorWorking] = useState(false);
+  const [vectorProgress, setVectorProgress] = useState<VectorProgress | null>(null);
   const [draft, setDraft] = useState("");
   const [isChecking, setIsChecking] = useState(false);
   const [isSending, setIsSending] = useState(false);
@@ -221,10 +241,13 @@ function App() {
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("chat");
   const [error, setError] = useState<string | null>(null);
   const [browserUrl, setBrowserUrl] = useState(
-    () => localStorage.getItem("tensor.browserUrl") ?? "https://www.wikipedia.org",
+    () => localStorage.getItem("tensor.browserUrl") ?? DEFAULT_BROWSER_HOME_URL,
   );
   const [browserInput, setBrowserInput] = useState(
-    () => localStorage.getItem("tensor.browserUrl") ?? "https://www.wikipedia.org",
+    () => localStorage.getItem("tensor.browserUrl") ?? DEFAULT_BROWSER_HOME_URL,
+  );
+  const [browserHomeUrl, setBrowserHomeUrl] = useState(
+    () => localStorage.getItem("tensor.browserHomeUrl") ?? DEFAULT_BROWSER_HOME_URL,
   );
   const [browserTitle, setBrowserTitle] = useState("Web browser");
   const [isBrowserLoading, setIsBrowserLoading] = useState(false);
@@ -237,6 +260,7 @@ function App() {
   const [zimitWorkers, setZimitWorkers] = useState("1");
   const [zimitWaitUntil, setZimitWaitUntil] = useState("load");
   const [zimitScopeExclude, setZimitScopeExclude] = useState("");
+  const [zimitScopeExcludeDraft, setZimitScopeExcludeDraft] = useState("");
   const [zimitKeep, setZimitKeep] = useState(false);
   const [zimitDisableAdBlocking, setZimitDisableAdBlocking] = useState(false);
   const [zimitImage, setZimitImage] = useState("ghcr.io/openzim/zimit");
@@ -250,16 +274,17 @@ function App() {
   const isConnected = health?.status === "ok";
   const isChatPanelOpen = !isSettingsMode && activeSidebar === "chat";
   const isChatVisible = !isSettingsMode && activeActivity === "chat" && !isChatPanelOpen;
+  const isSearchPanelOpen = !isSettingsMode && activeSidebar === "search";
   const isServingPanelOpen = !isSettingsMode && activeSidebar === "serving";
   const isDownloadsPanelOpen = !isSettingsMode && activeSidebar === "downloads";
   const isDatabasePanelOpen = !isSettingsMode && activeSidebar === "databases";
   const isSidebarOpen = !isSettingsMode && activeSidebar !== null;
-  const isSearchVisible = !isSettingsMode && activeActivity === "search";
+  const isSearchVisible = !isSettingsMode && activeActivity === "search" && !isSearchPanelOpen;
   const isBrowserVisible = !isSettingsMode && activeActivity === "browser";
   const isDownloadsVisible =
     !isSettingsMode && activeActivity === "downloads" && !isDownloadsPanelOpen;
   const chatNavActive = isSettingsMode ? settingsSection === "chat" : isChatVisible || isChatPanelOpen;
-  const searchNavActive = isSettingsMode ? settingsSection === "search" : isSearchVisible;
+  const searchNavActive = isSettingsMode ? settingsSection === "search" : isSearchVisible || isSearchPanelOpen;
   const browserNavActive = isSettingsMode ? settingsSection === "browser" : isBrowserVisible;
   const servingNavActive = isSettingsMode ? settingsSection === "serving" : isServingPanelOpen;
   const downloadsNavActive = isSettingsMode
@@ -289,6 +314,15 @@ function App() {
     () => downloadTaskList.filter((task) => task.id.startsWith("zimit:")),
     [downloadTaskList],
   );
+  const zimitScopeExcludeTags = useMemo(
+    () =>
+      zimitScopeExclude
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean),
+    [zimitScopeExclude],
+  );
+  const activeVectorDbId = normalizePathId(activeVectorDbPath);
   const modelOptions = useMemo(() => {
     const options = new Map<
       string,
@@ -370,6 +404,19 @@ function App() {
   useEffect(() => {
     localStorage.setItem("tensor.browserUrl", browserUrl);
   }, [browserUrl]);
+
+  useEffect(() => {
+    localStorage.setItem("tensor.browserHomeUrl", browserHomeUrl);
+  }, [browserHomeUrl]);
+
+  useEffect(() => {
+    if (health?.db_loaded && activeVectorDbPath) {
+      localStorage.setItem("tensor.activeVectorDbPath", activeVectorDbPath);
+    } else if (!health?.db_loaded) {
+      localStorage.removeItem("tensor.activeVectorDbPath");
+      setActiveVectorDbPath("");
+    }
+  }, [activeVectorDbPath, health?.db_loaded]);
 
   useEffect(() => {
     const unsubscribe = window.tensorDesktop?.onBrowserViewState?.((state) => {
@@ -812,6 +859,9 @@ function App() {
         title: entry.title,
         fileName: entry.name,
         status: "downloading",
+        sourceUrl: entry.downloadUrl,
+        receivedBytes: 0,
+        totalBytes: entry.sizeBytes,
       },
     }));
 
@@ -827,6 +877,9 @@ function App() {
           fileName: file.fileName,
           path: file.path,
           status: "ready",
+          sourceUrl: file.sourceUrl,
+          receivedBytes: file.sizeBytes,
+          totalBytes: file.sizeBytes,
         },
       }));
 
@@ -845,6 +898,9 @@ function App() {
           fileName: entry.name,
           status: "failed",
           error: caught instanceof Error ? caught.message : "Download failed.",
+          sourceUrl: entry.downloadUrl,
+          receivedBytes: 0,
+          totalBytes: entry.sizeBytes,
         },
       }));
       throw caught;
@@ -979,33 +1035,82 @@ function App() {
   async function resolveSelectedZimPaths() {
     if (selectedSourceCount === 0) {
       setVectorStatus("Select at least one local or collection ZIM file first.");
+      setVectorProgress(null);
       return [];
     }
 
     const zimPaths = new Set<string>();
+    const totalRegistrationSteps = Math.max(selectedSourceCount, 1);
+    let completedRegistrationSteps = 0;
+
+    setVectorProgress({
+      label: "Preparing ZIM files",
+      detail: `${selectedSourceCount} selected source(s)`,
+      current: 0,
+      total: totalRegistrationSteps,
+      status: "working",
+    });
 
     for (const file of selectedLocalZims) {
       setVectorStatus(`Registering ${file.fileName} with Tensor Serve...`);
+      setVectorProgress({
+        label: "Registering local ZIM files",
+        detail: file.fileName,
+        current: completedRegistrationSteps,
+        total: totalRegistrationSteps,
+        status: "working",
+      });
       zimPaths.add(file.path);
       await registerZim(baseUrl, file.path);
+      completedRegistrationSteps += 1;
+      setVectorProgress({
+        label: "Registering local ZIM files",
+        detail: file.fileName,
+        current: completedRegistrationSteps,
+        total: totalRegistrationSteps,
+        status: "working",
+      });
     }
 
     for (const file of selectedCollectionFiles) {
       zimPaths.add(file.path);
+      completedRegistrationSteps += 1;
+      setVectorProgress({
+        label: "Preparing collection ZIM files",
+        detail: file.name,
+        current: completedRegistrationSteps,
+        total: totalRegistrationSteps,
+        status: "working",
+      });
     }
 
     const paths = [...zimPaths];
     setVectorStatus(`Prepared ${paths.length} ZIM file(s).`);
+    setVectorProgress({
+      label: "ZIM files prepared",
+      detail: `${paths.length} unique file(s) ready`,
+      current: totalRegistrationSteps,
+      total: totalRegistrationSteps,
+      status: "working",
+    });
     return paths;
   }
 
   async function setupKnowledgeBase() {
     if (!vectorDbName.trim()) {
       setVectorStatus("Vector database name is required.");
+      setVectorProgress(null);
       return;
     }
 
     setIsVectorWorking(true);
+    setVectorProgress({
+      label: "Starting ingestion",
+      detail: generatedVectorDbId,
+      current: 0,
+      total: 4,
+      status: "working",
+    });
 
     try {
       const zimPaths = await resolveSelectedZimPaths();
@@ -1013,18 +1118,54 @@ function App() {
       if (zimPaths.length === 0) return;
 
       setVectorStatus(`Building ${generatedVectorDbId}...`);
+      setVectorProgress({
+        label: zimPaths.length === 1 ? "Ingesting ZIM file" : "Building vector database",
+        detail: `${zimPaths.length} ZIM file(s)`,
+        current: zimPaths.length === 1 ? 0 : undefined,
+        total: zimPaths.length === 1 ? 1 : undefined,
+        indeterminate: zimPaths.length !== 1,
+        status: "working",
+      });
       await ingestMultiple(baseUrl, zimPaths, generatedVectorDbId);
+      setVectorProgress({
+        label: zimPaths.length === 1 ? "ZIM file ingested" : "Vector database built",
+        detail: `${zimPaths.length} ZIM file(s)`,
+        current: zimPaths.length === 1 ? 1 : undefined,
+        total: zimPaths.length === 1 ? 1 : undefined,
+        indeterminate: zimPaths.length !== 1,
+        status: "working",
+      });
 
       setVectorStatus(`Loading ${generatedVectorDbId}...`);
+      setVectorProgress({
+        label: "Loading vector database",
+        detail: generatedVectorDbId,
+        current: 3,
+        total: 4,
+        status: "working",
+      });
       await loadVectorDb(baseUrl, generatedVectorDbId);
 
       const nextHealth = await getHealth(baseUrl);
       setHealth(nextHealth);
+      setActiveVectorDbPath(generatedVectorDbId);
       setVectorStatus(`Vector database ready: ${generatedVectorDbId}`);
+      setVectorProgress({
+        label: "Vector database ready",
+        detail: generatedVectorDbId,
+        current: 4,
+        total: 4,
+        status: "ready",
+      });
     } catch (caught) {
       setVectorStatus(
         caught instanceof Error ? caught.message : "Unable to set up the knowledge base.",
       );
+      setVectorProgress({
+        label: "Ingestion failed",
+        detail: caught instanceof Error ? caught.message : "Unable to set up the knowledge base.",
+        status: "failed",
+      });
     } finally {
       setIsVectorWorking(false);
     }
@@ -1033,10 +1174,18 @@ function App() {
   async function saveCollection() {
     if (!collectionName.trim()) {
       setVectorStatus("Collection name is required.");
+      setVectorProgress(null);
       return;
     }
 
     setIsVectorWorking(true);
+    setVectorProgress({
+      label: "Starting collection save",
+      detail: generatedCollectionId,
+      current: 0,
+      total: 3,
+      status: "working",
+    });
 
     try {
       const zimPaths = await resolveSelectedZimPaths();
@@ -1044,6 +1193,12 @@ function App() {
       if (zimPaths.length === 0) return;
 
       setVectorStatus(`Creating collection ${generatedCollectionId}...`);
+      setVectorProgress({
+        label: "Creating collection",
+        detail: `${zimPaths.length} ZIM file(s)`,
+        indeterminate: true,
+        status: "working",
+      });
       await createCollection(
         baseUrl,
         generatedCollectionId,
@@ -1054,8 +1209,20 @@ function App() {
 
       await refreshCollections();
       setVectorStatus(`Collection ready: ${generatedCollectionId}`);
+      setVectorProgress({
+        label: "Collection ready",
+        detail: generatedCollectionId,
+        current: 3,
+        total: 3,
+        status: "ready",
+      });
     } catch (caught) {
       setVectorStatus(caught instanceof Error ? caught.message : "Unable to create collection.");
+      setVectorProgress({
+        label: "Collection failed",
+        detail: caught instanceof Error ? caught.message : "Unable to create collection.",
+        status: "failed",
+      });
     } finally {
       setIsVectorWorking(false);
     }
@@ -1080,6 +1247,11 @@ function App() {
   }
 
   async function deployVectorDatabase(database: VectorDatabaseSummary) {
+    if (isVectorDatabaseActive(database)) {
+      setVectorStatus(`${database.name} is already deployed.`);
+      return;
+    }
+
     setIsVectorWorking(true);
     setVectorStatus(`Deploying ${database.name}...`);
 
@@ -1087,6 +1259,7 @@ function App() {
       await loadVectorDb(baseUrl, database.path);
       const nextHealth = await getHealth(baseUrl);
       setHealth(nextHealth);
+      setActiveVectorDbPath(database.path);
       setVectorStatus(`Deployed ${database.name}.`);
     } catch (caught) {
       setVectorStatus(caught instanceof Error ? caught.message : "Unable to deploy database.");
@@ -1095,49 +1268,68 @@ function App() {
     }
   }
 
-  function selectActivity(section: "chat" | "search" | "browser") {
+  function isVectorDatabaseActive(database: VectorDatabaseSummary) {
+    if (!health?.db_loaded || !activeVectorDbId) return false;
+
+    const databasePath = normalizePathId(database.path);
+    const databaseName = normalizePathId(database.name);
+
+    return (
+      activeVectorDbId === databasePath ||
+      activeVectorDbId === databaseName ||
+      activeVectorDbId.endsWith(`/${database.name}`)
+    );
+  }
+
+  function openFullScreen(section: ActivityId) {
     if (isSettingsMode) {
       setSettingsSection(section);
       return;
     }
 
-    if (section === "chat") {
-      setActiveSidebar((current) => (current === "chat" ? null : current));
-    }
-
+    setActiveSidebar(null);
+    setIsSettingsMode(false);
     setActiveActivity(section);
   }
 
-  function selectDownloadsActivity() {
+  function noteMissingFullScreenView(label: string, settingsFallback?: SettingsSection) {
     if (isSettingsMode) {
-      setSettingsSection("downloads");
+      if (settingsFallback) setSettingsSection(settingsFallback);
       return;
     }
 
-    setActiveSidebar((current) => (current === "downloads" ? null : current));
-    setActiveActivity("downloads");
+    setIsSettingsMode(false);
+    setActiveSidebar(null);
+    setError(`${label} does not have a full-screen view yet. Right-click its navbar icon to open the sidebar.`);
   }
 
-  function dockActivity(section: "chat" | "downloads") {
+  function openSidebar(section: SidebarId) {
     if (isSettingsMode) {
       setSettingsSection(section);
       return;
     }
 
-    if (section === activeActivity) {
-      setActiveActivity(section === "chat" ? "search" : "chat");
+    if (activeSidebar === section) {
+      setActiveSidebar(null);
+      return;
+    }
+
+    setIsSettingsMode(false);
+
+    if (isSidebarCapableActivity(section) && activeActivity === section) {
+      return;
     }
 
     setActiveSidebar(section);
   }
 
-  function toggleSidebar(section: SidebarId) {
-    if (isSettingsMode) {
-      setSettingsSection(section);
-      return;
-    }
+  function isSidebarCapableActivity(section: SidebarId): section is SidebarCapableActivityId {
+    return section === "chat" || section === "search" || section === "downloads";
+  }
 
-    setActiveSidebar((current) => (current === section ? null : section));
+  function handleSidebarContextMenu(event: MouseEvent, section: SidebarId) {
+    event.preventDefault();
+    openSidebar(section);
   }
 
   function toggleSettingsMode() {
@@ -1161,7 +1353,7 @@ function App() {
 
   const settingsTitle = {
     chat: "Chat settings",
-    search: "Search settings",
+    search: "Create settings",
     files: "File settings",
     browser: "Browser settings",
     serving: "Serving settings",
@@ -1200,9 +1392,13 @@ function App() {
     const nextUrl = normalizeBrowserUrl(browserInput);
     if (!nextUrl) return;
 
+    void navigateBrowserTo(nextUrl);
+  }
+
+  async function navigateBrowserTo(nextUrl: string) {
     setBrowserInput(nextUrl);
     setBrowserUrl(nextUrl);
-    void window.tensorDesktop?.navigateBrowserView?.(nextUrl).then((state) => {
+    await window.tensorDesktop?.navigateBrowserView?.(nextUrl).then((state) => {
       applyBrowserViewState(state);
     });
   }
@@ -1219,10 +1415,69 @@ function App() {
   function getDownloadTaskDetail(task: DownloadTask) {
     if (task.status === "downloading" && task.totalBytes && task.totalBytes > 0) {
       const percent = Math.min(100, Math.round(((task.receivedBytes ?? 0) / task.totalBytes) * 100));
-      return `${percent}% of ${formatBytes(task.totalBytes)}`;
+      return `${formatBytes(task.receivedBytes ?? 0)} of ${formatBytes(task.totalBytes)} (${percent}%)`;
+    }
+
+    if (task.status === "downloading" && task.receivedBytes) {
+      return `${formatBytes(task.receivedBytes)} downloaded`;
     }
 
     return task.path ?? task.sourceUrl ?? task.fileName;
+  }
+
+  function getDownloadProgress(task: DownloadTask) {
+    if (!task.totalBytes || task.totalBytes <= 0) return null;
+
+    return Math.min(100, Math.round(((task.receivedBytes ?? 0) / task.totalBytes) * 100));
+  }
+
+  function renderDownloadProgress(task: DownloadTask) {
+    const progress = getDownloadProgress(task);
+
+    if (progress === null) {
+      return task.status === "downloading" ? <div className="download-progress indeterminate" /> : null;
+    }
+
+    return (
+      <div
+        className="download-progress"
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={progress}
+      >
+        <span style={{ width: `${progress}%` }} />
+      </div>
+    );
+  }
+
+  function renderVectorProgress() {
+    if (!vectorProgress) return null;
+
+    const progress =
+      vectorProgress.total && vectorProgress.total > 0 && vectorProgress.current !== undefined
+        ? Math.min(100, Math.round((vectorProgress.current / vectorProgress.total) * 100))
+        : null;
+    const isIndeterminate = vectorProgress.indeterminate || progress === null;
+
+    return (
+      <div className={`vector-progress-card ${vectorProgress.status}`}>
+        <div className="vector-progress-heading">
+          <strong>{vectorProgress.label}</strong>
+          {progress !== null && <span>{progress}%</span>}
+        </div>
+        {vectorProgress.detail && <small>{vectorProgress.detail}</small>}
+        <div
+          className={`download-progress ${isIndeterminate ? "indeterminate" : ""}`}
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={progress ?? undefined}
+        >
+          {!isIndeterminate && <span style={{ width: `${progress}%` }} />}
+        </div>
+      </div>
+    );
   }
 
   async function chooseZimitOutputDirectory() {
@@ -1237,6 +1492,71 @@ function App() {
   function zimitNumber(value: string) {
     const number = Number(value);
     return Number.isFinite(number) && number > 0 ? number : undefined;
+  }
+
+  function setZimitScopeExcludeTags(tags: string[]) {
+    const normalizedTags = [...new Set(tags.map((tag) => tag.trim()).filter(Boolean))];
+    setZimitScopeExclude(normalizedTags.join("\n"));
+  }
+
+  function addZimitScopeExcludeTag(value = zimitScopeExcludeDraft) {
+    const nextTags = value
+      .split(/\r?\n/)
+      .map((tag) => tag.trim())
+      .filter(Boolean);
+
+    if (nextTags.length === 0) return;
+
+    setZimitScopeExcludeTags([...zimitScopeExcludeTags, ...nextTags]);
+    setZimitScopeExcludeDraft("");
+  }
+
+  function removeZimitScopeExcludeTag(index: number) {
+    setZimitScopeExcludeTags(zimitScopeExcludeTags.filter((_, tagIndex) => tagIndex !== index));
+  }
+
+  function handleZimitScopeExcludeKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addZimitScopeExcludeTag();
+    }
+  }
+
+  function renderZimitScopeExcludeInput(className = "") {
+    return (
+      <div className={`field tag-field ${className}`.trim()}>
+        <span id="zimit-scope-exclude-label">Scope exclude regex</span>
+        <div className="tag-input-shell">
+          {zimitScopeExcludeTags.map((tag, index) => (
+            <button
+              className="tag-chip"
+              type="button"
+              key={`${tag}-${index}`}
+              onClick={() => removeZimitScopeExcludeTag(index)}
+              title="Remove regex"
+            >
+              <span>{tag}</span>
+              <span aria-hidden="true">x</span>
+            </button>
+          ))}
+          <input
+            value={zimitScopeExcludeDraft}
+            onChange={(event) => setZimitScopeExcludeDraft(event.target.value)}
+            onKeyDown={handleZimitScopeExcludeKeyDown}
+            onBlur={() => addZimitScopeExcludeTag()}
+            onPaste={(event) => {
+              const text = event.clipboardData.getData("text");
+              if (!/\r?\n/.test(text)) return;
+              event.preventDefault();
+              addZimitScopeExcludeTag(text);
+            }}
+            placeholder={zimitScopeExcludeTags.length === 0 ? "\\?q= or /login" : "Add regex"}
+            aria-label="Add scope exclude regex"
+            aria-labelledby="zimit-scope-exclude-label"
+          />
+        </div>
+      </div>
+    );
   }
 
   async function startZimitCapture() {
@@ -1258,10 +1578,7 @@ function App() {
       pageLimit: zimitNumber(zimitPageLimit),
       workers: zimitNumber(zimitWorkers),
       waitUntil: zimitWaitUntil,
-      scopeExcludeRx: zimitScopeExclude
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean),
+      scopeExcludeRx: zimitScopeExcludeTags,
       keep: zimitKeep,
       disableAdBlocking: zimitDisableAdBlocking,
       image: zimitImage.trim() || undefined,
@@ -1291,6 +1608,21 @@ function App() {
     }
   }
 
+  function resetConversation() {
+    setMessages([
+      createMessage("assistant", "Tensor client ready. Connect to Tensor Serve and start chatting."),
+    ]);
+    setDraft("");
+  }
+
+  function clearFinishedDownloads() {
+    setDownloadTasks((current) =>
+      Object.fromEntries(
+        Object.entries(current).filter(([, task]) => task.status === "downloading"),
+      ),
+    );
+  }
+
   return (
     <main className={`app-shell ${isSidebarOpen ? "sidebar-open" : ""}`}>
       <nav className="activity-bar" aria-label="Primary navigation">
@@ -1301,23 +1633,21 @@ function App() {
             aria-label="Chat"
             aria-pressed={chatNavActive}
             title="Chat"
-            onClick={() => selectActivity("chat")}
-            onContextMenu={(event) => {
-              event.preventDefault();
-              dockActivity("chat");
-            }}
+            onClick={() => openFullScreen("chat")}
+            onContextMenu={(event) => handleSidebarContextMenu(event, "chat")}
           >
             <MessageSquare size={22} />
           </button>
           <button
             className={`activity-button ${searchNavActive ? "active" : ""}`}
             type="button"
-            aria-label="Search"
+            aria-label="Create"
             aria-pressed={searchNavActive}
-            title="Search"
-            onClick={() => selectActivity("search")}
+            title="Create"
+            onClick={() => openFullScreen("search")}
+            onContextMenu={(event) => handleSidebarContextMenu(event, "search")}
           >
-            <Search size={22} />
+            <Plus size={22} />
           </button>
           <button
             className={`activity-button ${browserNavActive ? "active" : ""}`}
@@ -1325,7 +1655,7 @@ function App() {
             aria-label="Browser"
             aria-pressed={browserNavActive}
             title="Browser"
-            onClick={() => selectActivity("browser")}
+            onClick={() => openFullScreen("browser")}
           >
             <Globe2 size={22} />
           </button>
@@ -1338,7 +1668,8 @@ function App() {
             aria-label="Serving"
             aria-pressed={servingNavActive}
             title="Serving"
-            onClick={() => toggleSidebar("serving")}
+            onClick={() => openSidebar("serving")}
+            onContextMenu={(event) => handleSidebarContextMenu(event, "serving")}
           >
             <Server size={22} />
           </button>
@@ -1348,11 +1679,8 @@ function App() {
             aria-label="Downloads"
             aria-pressed={downloadsNavActive}
             title="Downloads"
-            onClick={selectDownloadsActivity}
-            onContextMenu={(event) => {
-              event.preventDefault();
-              dockActivity("downloads");
-            }}
+            onClick={() => openFullScreen("downloads")}
+            onContextMenu={(event) => handleSidebarContextMenu(event, "downloads")}
           >
             <Download size={22} />
           </button>
@@ -1362,7 +1690,8 @@ function App() {
             aria-label="Vector databases"
             aria-pressed={databaseNavActive}
             title="Vector databases"
-            onClick={() => toggleSidebar("databases")}
+            onClick={() => openSidebar("databases")}
+            onContextMenu={(event) => handleSidebarContextMenu(event, "databases")}
           >
             <Database size={22} />
           </button>
@@ -1446,6 +1775,317 @@ function App() {
                 Send
               </button>
             </form>
+          </section>
+        </aside>
+      )}
+
+      {isSearchPanelOpen && (
+        <aside className="sidebar create-sidebar">
+          <div className="brand">
+            <div className="brand-mark">
+              <Plus size={22} />
+            </div>
+            <div>
+              <h1>Create</h1>
+              <p>{selectedSourceCount} selected source(s)</p>
+            </div>
+          </div>
+
+          <section className="create-sidebar-section">
+            <h3>Sources</h3>
+            <div className="setup-tabs create-sidebar-tabs" role="tablist" aria-label="Create source">
+              <button
+                className={vectorSource === "local" ? "active" : ""}
+                type="button"
+                role="tab"
+                aria-selected={vectorSource === "local"}
+                onClick={() => setVectorSource("local")}
+              >
+                Local
+              </button>
+              <button
+                className={vectorSource === "collections" ? "active" : ""}
+                type="button"
+                role="tab"
+                aria-selected={vectorSource === "collections"}
+                onClick={() => {
+                  setVectorSource("collections");
+                  if (availableCollections.length === 0) void refreshCollections();
+                }}
+              >
+                Collections
+              </button>
+              <button
+                className={vectorSource === "archive" ? "active" : ""}
+                type="button"
+                role="tab"
+                aria-selected={vectorSource === "archive"}
+                onClick={() => setVectorSource("archive")}
+              >
+                Archive
+              </button>
+            </div>
+
+            {vectorSource === "local" && (
+              <div className="create-sidebar-list">
+                {localBrowserPath ? (
+                  <div className="local-browser-path compact-path">
+                    <strong>{localBrowserPath}</strong>
+                    <small>{localBrowserEntries.length} visible item(s)</small>
+                  </div>
+                ) : (
+                  <div className="sidebar-empty">
+                    <strong>No folder opened</strong>
+                    <small>Open a folder to browse local ZIM files.</small>
+                  </div>
+                )}
+                {localBrowserParentPath && (
+                  <button
+                    className="tree-row"
+                    type="button"
+                    onClick={() => void openLocalDirectory(localBrowserParentPath)}
+                  >
+                    <ChevronLeft size={16} />
+                    <span>
+                      <strong>Parent folder</strong>
+                      <small>{localBrowserParentPath}</small>
+                    </span>
+                  </button>
+                )}
+                {localBrowserEntries.map((entry) => {
+                  const isSelected = selectedLocalZims.some((item) => item.path === entry.path);
+
+                  return (
+                    <button
+                      className={`tree-row ${isSelected ? "selected" : ""}`}
+                      type="button"
+                      key={entry.path}
+                      onClick={() =>
+                        entry.type === "directory"
+                          ? void openLocalDirectory(entry.path)
+                          : toggleLocalZim(entry)
+                      }
+                    >
+                      {entry.type === "directory" ? <FolderOpen size={16} /> : <FileIcon size={16} />}
+                      <span>
+                        <strong>{entry.name}</strong>
+                        <small>
+                          {entry.type === "directory"
+                            ? "Folder"
+                            : `${Math.round((entry.sizeBytes ?? 0) / 1024 / 1024)} MB`}
+                        </small>
+                      </span>
+                    </button>
+                  );
+                })}
+                <button
+                  className="secondary-button wide-button"
+                  type="button"
+                  onClick={() => void chooseLocalDirectory()}
+                >
+                  <FolderOpen size={16} />
+                  Choose folder
+                </button>
+              </div>
+            )}
+
+            {vectorSource === "collections" && (
+              <div className="create-sidebar-list">
+                <button
+                  className="secondary-button wide-button"
+                  type="button"
+                  onClick={() => void refreshCollections()}
+                  disabled={isCollectionsLoading}
+                >
+                  {isCollectionsLoading ? (
+                    <Loader2 className="spin" size={16} />
+                  ) : (
+                    <RefreshCcw size={16} />
+                  )}
+                  Refresh collections
+                </button>
+                {availableCollections.length === 0 ? (
+                  <div className="sidebar-empty">
+                    <strong>No collections loaded</strong>
+                    <small>Refresh Tensor Serve collections.</small>
+                  </div>
+                ) : (
+                  availableCollections.map((collection) => {
+                    const isSelected = selectedCollections.some((item) => item.id === collection.id);
+
+                    return (
+                      <button
+                        className={`tree-row ${isSelected ? "selected" : ""}`}
+                        type="button"
+                        key={collection.id}
+                        onClick={() => void toggleCollection(collection)}
+                        disabled={isCollectionsLoading}
+                      >
+                        <Database size={16} />
+                        <span>
+                          <strong>{collection.name}</strong>
+                          <small>{collection.file_count} file(s) · {collection.category || "collection"}</small>
+                        </span>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            )}
+
+            {vectorSource === "archive" && (
+              <div className="create-sidebar-list">
+                <form className="sidebar-archive-search" onSubmit={submitCatalogSearch}>
+                  <label className="field">
+                    <span>Search archive</span>
+                    <input
+                      value={catalogQuery}
+                      onChange={(event) => setCatalogQuery(event.target.value)}
+                      placeholder="python, devdocs..."
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Language</span>
+                    <input
+                      value={catalogLanguage}
+                      onChange={(event) => setCatalogLanguage(event.target.value)}
+                      placeholder="eng"
+                    />
+                  </label>
+                  <button className="secondary-button wide-button" type="submit" disabled={isCatalogLoading}>
+                    {isCatalogLoading ? <Loader2 className="spin" size={16} /> : <Search size={16} />}
+                    Search archive
+                  </button>
+                </form>
+                {catalogResults.length === 0 ? (
+                  <div className="sidebar-empty">
+                    <strong>No archive results</strong>
+                    <small>Search Kiwix to find ZIM files.</small>
+                  </div>
+                ) : (
+                  catalogResults.slice(0, 8).map((entry) => {
+                    const task = downloadTasks[entry.id];
+                    const isReady = Boolean(downloadedZims[entry.id]) || task?.status === "ready";
+
+                    return (
+                      <article className="archive-sidebar-item" key={entry.id}>
+                        <div>
+                          <strong>{entry.title}</strong>
+                          <small>{entry.language} · {entry.category} · {formatBytes(entry.sizeBytes)}</small>
+                        </div>
+                        <button
+                          className="secondary-button"
+                          type="button"
+                          onClick={() => void downloadCatalogEntry(entry)}
+                          disabled={task?.status === "downloading" || isReady}
+                        >
+                          {task?.status === "downloading" ? (
+                            <Loader2 className="spin" size={14} />
+                          ) : isReady ? (
+                            <CircleCheck size={14} />
+                          ) : (
+                            <Download size={14} />
+                          )}
+                        </button>
+                      </article>
+                    );
+                  })
+                )}
+              </div>
+            )}
+          </section>
+
+          <section className="create-sidebar-section create-output-section">
+            <h3>Knowledge output</h3>
+            <label className="field">
+              <span>Type</span>
+              <select
+                value={vectorSetupMode}
+                onChange={(event) => setVectorSetupMode(event.target.value as VectorSetupMode)}
+              >
+                <option value="database">Vector database</option>
+                <option value="collection">Collection</option>
+              </select>
+            </label>
+
+            {vectorSetupMode === "database" ? (
+              <>
+                <label className="field">
+                  <span>Name</span>
+                  <input
+                    value={vectorDbName}
+                    onChange={(event) => setVectorDbName(event.target.value)}
+                  />
+                </label>
+                <p className="generated-id">ID: {generatedVectorDbId}</p>
+              </>
+            ) : (
+              <>
+                <label className="field">
+                  <span>Name</span>
+                  <input
+                    value={collectionName}
+                    onChange={(event) => setCollectionName(event.target.value)}
+                  />
+                </label>
+                <p className="generated-id">ID: {generatedCollectionId}</p>
+                <label className="field">
+                  <span>Description</span>
+                  <textarea
+                    value={collectionDescription}
+                    onChange={(event) => setCollectionDescription(event.target.value)}
+                    rows={3}
+                  />
+                </label>
+              </>
+            )}
+
+            <div className="selected-list create-sidebar-selected">
+              <span>{selectedSourceCount} selected ZIM file(s)</span>
+              {selectedLocalZims.map((file) => (
+                <div key={file.path}>
+                  <strong>{file.fileName}</strong>
+                  <small>{file.path}</small>
+                  <button type="button" onClick={() => removeLocalZim(file.path)}>
+                    Remove
+                  </button>
+                </div>
+              ))}
+              {selectedCollections.map((collection) => {
+                const fileCount = (collection.files ?? collection.zim_files ?? []).filter(
+                  (file) => file.path && file.installed !== false,
+                ).length;
+
+                return (
+                  <div key={collection.id}>
+                    <strong>{collection.name}</strong>
+                    <small>
+                      {collection.id} · {fileCount} collection file(s)
+                    </small>
+                    <button type="button" onClick={() => removeSelectedCollection(collection.id)}>
+                      Remove
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+
+            <button
+              className="send-button wide-button"
+              type="button"
+              disabled={isVectorWorking || selectedSourceCount === 0}
+              onClick={() =>
+                vectorSetupMode === "database"
+                  ? void setupKnowledgeBase()
+                  : void saveCollection()
+              }
+            >
+              {isVectorWorking ? <Loader2 className="spin" size={18} /> : <Database size={18} />}
+              {vectorSetupMode === "database" ? "Build database" : "Create collection"}
+            </button>
+
+            {renderVectorProgress()}
+            {vectorStatus && <p className="vector-status">{vectorStatus}</p>}
           </section>
         </aside>
       )}
@@ -1645,6 +2285,7 @@ function App() {
                           <small>{task.logs.at(-1)}</small>
                         )}
                         {task.error && <small>{task.error}</small>}
+                        {renderDownloadProgress(task)}
                       </div>
                       <span className="download-task-status">
                         {task.status === "downloading" && <Loader2 className="spin" size={14} />}
@@ -1716,37 +2357,43 @@ function App() {
               </div>
             ) : (
               <div className="database-sidebar-items">
-                {vectorDatabases.map((database) => (
-                  <article className="database-sidebar-item" key={database.path}>
-                    <div>
-                      <strong>{database.name}</strong>
-                      <small>{database.path}</small>
-                    </div>
-                    <dl className="database-facts">
+                {vectorDatabases.map((database) => {
+                  const isActive = isVectorDatabaseActive(database);
+
+                  return (
+                    <article className={`database-sidebar-item ${isActive ? "active" : ""}`} key={database.path}>
                       <div>
-                        <dt>Search</dt>
-                        <dd>{database.hasBm25 ? "Hybrid" : "Semantic"}</dd>
+                        <strong>{database.name}</strong>
+                        <small>{database.path}</small>
                       </div>
-                      <div>
-                        <dt>Size</dt>
-                        <dd>{formatBytes(database.sizeBytes)}</dd>
-                      </div>
-                    </dl>
-                    <button
-                      className="send-button wide-button"
-                      type="button"
-                      onClick={() => void deployVectorDatabase(database)}
-                      disabled={isVectorWorking}
-                    >
-                      {isVectorWorking ? (
-                        <Loader2 className="spin" size={16} />
-                      ) : (
-                        <PlugZap size={16} />
-                      )}
-                      Deploy
-                    </button>
-                  </article>
-                ))}
+                      <dl className="database-facts">
+                        <div>
+                          <dt>Search</dt>
+                          <dd>{database.hasBm25 ? "Hybrid" : "Semantic"}</dd>
+                        </div>
+                        <div>
+                          <dt>Size</dt>
+                          <dd>{formatBytes(database.sizeBytes)}</dd>
+                        </div>
+                      </dl>
+                      <button
+                        className="send-button wide-button"
+                        type="button"
+                        onClick={() => void deployVectorDatabase(database)}
+                        disabled={isVectorWorking || isActive}
+                      >
+                        {isVectorWorking && !isActive ? (
+                          <Loader2 className="spin" size={16} />
+                        ) : isActive ? (
+                          <CircleCheck size={16} />
+                        ) : (
+                          <PlugZap size={16} />
+                        )}
+                        {isActive ? "Deployed" : "Deploy"}
+                      </button>
+                    </article>
+                  );
+                })}
               </div>
             )}
 
@@ -1839,7 +2486,21 @@ function App() {
                       <dt>Messages</dt>
                       <dd>{messages.length}</dd>
                     </div>
+                    <div>
+                      <dt>Connection</dt>
+                      <dd>{statusLabel}</dd>
+                    </div>
                   </dl>
+                  <div className="settings-actions">
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={resetConversation}
+                    >
+                      <MessageSquare size={16} />
+                      Reset chat
+                    </button>
+                  </div>
                 </section>
               </div>
             )}
@@ -1867,6 +2528,26 @@ function App() {
                 <section className="settings-panel">
                   <h3>Create defaults</h3>
                   <label className="field">
+                    <span>Default source</span>
+                    <select
+                      value={vectorSource}
+                      onChange={(event) => setVectorSource(event.target.value as VectorSource)}
+                    >
+                      <option value="local">Local files</option>
+                      <option value="collections">Collections</option>
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>Default create type</span>
+                    <select
+                      value={vectorSetupMode}
+                      onChange={(event) => setVectorSetupMode(event.target.value as VectorSetupMode)}
+                    >
+                      <option value="database">Vector database</option>
+                      <option value="collection">Collection</option>
+                    </select>
+                  </label>
+                  <label className="field">
                     <span>Vector database name</span>
                     <input
                       value={vectorDbName}
@@ -1882,6 +2563,14 @@ function App() {
                     />
                   </label>
                   <p className="generated-id">ID: {generatedCollectionId}</p>
+                  <label className="field">
+                    <span>Collection description</span>
+                    <textarea
+                      value={collectionDescription}
+                      onChange={(event) => setCollectionDescription(event.target.value)}
+                      rows={3}
+                    />
+                  </label>
                 </section>
               </div>
             )}
@@ -1903,6 +2592,10 @@ function App() {
                       <dt>Selected ZIMs</dt>
                       <dd>{selectedLocalZims.length}</dd>
                     </div>
+                    <div>
+                      <dt>Collections</dt>
+                      <dd>{selectedCollections.length}</dd>
+                    </div>
                   </dl>
                   <div className="settings-actions">
                     <button
@@ -1921,6 +2614,18 @@ function App() {
                       <FolderOpen size={16} />
                       Choose folder
                     </button>
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => {
+                        setSelectedLocalZims([]);
+                        setSelectedCollections([]);
+                      }}
+                      disabled={selectedSourceCount === 0}
+                    >
+                      <CircleAlert size={16} />
+                      Clear selected
+                    </button>
                   </div>
                 </section>
               </div>
@@ -1930,9 +2635,126 @@ function App() {
               <div className="settings-grid">
                 <section className="settings-panel">
                   <h3>Browser</h3>
-                  <p className="settings-note">
-                    Browser controls use a native Electron page view behind the TSRC toolbar.
-                  </p>
+                  <label className="field">
+                    <span>Home page</span>
+                    <input
+                      value={browserHomeUrl}
+                      onChange={(event) => setBrowserHomeUrl(event.target.value)}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Current address</span>
+                    <input
+                      value={browserInput}
+                      onChange={(event) => setBrowserInput(event.target.value)}
+                    />
+                  </label>
+                  <div className="settings-actions">
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => void navigateBrowserTo(normalizeBrowserUrl(browserInput))}
+                      disabled={!browserInput.trim()}
+                    >
+                      <Globe2 size={16} />
+                      Navigate
+                    </button>
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => void navigateBrowserTo(normalizeBrowserUrl(browserHomeUrl))}
+                      disabled={!browserHomeUrl.trim()}
+                    >
+                      <Home size={16} />
+                      Home
+                    </button>
+                  </div>
+                </section>
+
+                <section className="settings-panel">
+                  <h3>Zimit capture</h3>
+                  <label className="field">
+                    <span>Default ZIM name</span>
+                    <input value={zimitName} onChange={(event) => setZimitName(event.target.value)} />
+                  </label>
+                  <label className="field">
+                    <span>Output folder</span>
+                    <input
+                      value={zimitOutputDir}
+                      onChange={(event) => setZimitOutputDir(event.target.value)}
+                      placeholder={config?.zim_source_folder || "Downloads/TSRC Zimit"}
+                    />
+                  </label>
+                  <div className="settings-actions">
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => void chooseZimitOutputDirectory()}
+                    >
+                      <FolderOpen size={16} />
+                      Folder
+                    </button>
+                  </div>
+                  <label className="field">
+                    <span>Page limit</span>
+                    <input
+                      value={zimitPageLimit}
+                      onChange={(event) => setZimitPageLimit(event.target.value)}
+                      inputMode="numeric"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Workers</span>
+                    <input
+                      value={zimitWorkers}
+                      onChange={(event) => setZimitWorkers(event.target.value)}
+                      inputMode="numeric"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Wait until</span>
+                    <select
+                      value={zimitWaitUntil}
+                      onChange={(event) => setZimitWaitUntil(event.target.value)}
+                    >
+                      <option value="load">load</option>
+                      <option value="domcontentloaded">domcontentloaded</option>
+                      <option value="networkidle0">networkidle0</option>
+                      <option value="networkidle2">networkidle2</option>
+                    </select>
+                  </label>
+                </section>
+
+                <section className="settings-panel">
+                  <h3>Zimit advanced</h3>
+                  <label className="field">
+                    <span>Docker image</span>
+                    <input value={zimitImage} onChange={(event) => setZimitImage(event.target.value)} />
+                  </label>
+                  {renderZimitScopeExcludeInput()}
+                  <label className="field">
+                    <span>Extra args</span>
+                    <input
+                      value={zimitExtraArgs}
+                      onChange={(event) => setZimitExtraArgs(event.target.value)}
+                    />
+                  </label>
+                  <label className="toggle-field">
+                    <input
+                      type="checkbox"
+                      checked={zimitKeep}
+                      onChange={(event) => setZimitKeep(event.target.checked)}
+                    />
+                    Keep crawl artifacts
+                  </label>
+                  <label className="toggle-field">
+                    <input
+                      type="checkbox"
+                      checked={zimitDisableAdBlocking}
+                      onChange={(event) => setZimitDisableAdBlocking(event.target.checked)}
+                    />
+                    Disable image ad filtering
+                  </label>
                 </section>
               </div>
             )}
@@ -2058,7 +2880,39 @@ function App() {
                       <dt>Tracked</dt>
                       <dd>{downloadTaskList.length}</dd>
                     </div>
+                    <div>
+                      <dt>Active</dt>
+                      <dd>{downloadTaskList.filter((task) => task.status === "downloading").length}</dd>
+                    </div>
+                    <div>
+                      <dt>Save path</dt>
+                      <dd>{config?.zim_source_folder || "System Downloads"}</dd>
+                    </div>
                   </dl>
+                  <div className="settings-actions">
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={clearFinishedDownloads}
+                      disabled={downloadTaskList.every((task) => task.status === "downloading")}
+                    >
+                      <CircleCheck size={16} />
+                      Clear finished
+                    </button>
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => void searchCatalog()}
+                      disabled={isCatalogLoading}
+                    >
+                      {isCatalogLoading ? (
+                        <Loader2 className="spin" size={16} />
+                      ) : (
+                        <Search size={16} />
+                      )}
+                      Search catalog
+                    </button>
+                  </div>
                 </section>
               </div>
             )}
@@ -2080,6 +2934,10 @@ function App() {
                       <dt>Search</dt>
                       <dd>{health?.bm25_loaded ? "Hybrid" : health?.db_loaded ? "Semantic" : "None"}</dd>
                     </div>
+                    <div>
+                      <dt>Active</dt>
+                      <dd>{activeVectorDbPath || "Unknown"}</dd>
+                    </div>
                   </dl>
                   <button
                     className="secondary-button"
@@ -2096,29 +2954,61 @@ function App() {
                   </button>
                 </section>
 
+                <section className="settings-panel">
+                  <h3>Create defaults</h3>
+                  <label className="field">
+                    <span>Vector database name</span>
+                    <input
+                      value={vectorDbName}
+                      onChange={(event) => setVectorDbName(event.target.value)}
+                    />
+                  </label>
+                  <p className="generated-id">ID: {generatedVectorDbId}</p>
+                  <label className="field">
+                    <span>Collection name</span>
+                    <input
+                      value={collectionName}
+                      onChange={(event) => setCollectionName(event.target.value)}
+                    />
+                  </label>
+                  <p className="generated-id">ID: {generatedCollectionId}</p>
+                  <label className="field">
+                    <span>Collection description</span>
+                    <textarea
+                      value={collectionDescription}
+                      onChange={(event) => setCollectionDescription(event.target.value)}
+                      rows={3}
+                    />
+                  </label>
+                </section>
+
                 <section className="settings-panel settings-list-panel">
                   <h3>Available databases</h3>
                   {vectorDatabases.length === 0 ? (
                     <p className="settings-note">No local vector databases found.</p>
                   ) : (
                     <div className="database-sidebar-items">
-                      {vectorDatabases.map((database) => (
-                        <article className="database-sidebar-item" key={database.path}>
-                          <div>
-                            <strong>{database.name}</strong>
-                            <small>{database.path}</small>
-                          </div>
-                          <button
-                            className="send-button wide-button"
-                            type="button"
-                            onClick={() => void deployVectorDatabase(database)}
-                            disabled={isVectorWorking}
-                          >
-                            <PlugZap size={16} />
-                            Deploy
-                          </button>
-                        </article>
-                      ))}
+                      {vectorDatabases.map((database) => {
+                        const isActive = isVectorDatabaseActive(database);
+
+                        return (
+                          <article className={`database-sidebar-item ${isActive ? "active" : ""}`} key={database.path}>
+                            <div>
+                              <strong>{database.name}</strong>
+                              <small>{database.path}</small>
+                            </div>
+                            <button
+                              className="send-button wide-button"
+                              type="button"
+                              onClick={() => void deployVectorDatabase(database)}
+                              disabled={isVectorWorking || isActive}
+                            >
+                              {isActive ? <CircleCheck size={16} /> : <PlugZap size={16} />}
+                              {isActive ? "Deployed" : "Deploy"}
+                            </button>
+                          </article>
+                        );
+                      })}
                     </div>
                   )}
                   {vectorStatus && <p className="vector-status">{vectorStatus}</p>}
@@ -2253,6 +3143,7 @@ function App() {
                           <small>{task.logs.at(-1)}</small>
                         )}
                         {task.error && <small>{task.error}</small>}
+                        {renderDownloadProgress(task)}
                       </div>
                       <span className="download-task-status">
                         {task.status === "downloading" && <Loader2 className="spin" size={14} />}
@@ -2324,7 +3215,7 @@ function App() {
                 aria-label="Home"
                 title="Home"
                 onClick={() => {
-                  const homeUrl = "https://www.wikipedia.org";
+                  const homeUrl = normalizeBrowserUrl(browserHomeUrl) || DEFAULT_BROWSER_HOME_URL;
                   setBrowserInput(homeUrl);
                   setBrowserUrl(homeUrl);
                   void window.tensorDesktop?.navigateBrowserView?.(homeUrl).then((state) => {
@@ -2362,7 +3253,7 @@ function App() {
               title="Save website as ZIM"
               onClick={() => setIsZimitPanelOpen((current) => !current)}
             >
-              <Download size={18} />
+              <img className="openzim-logo-icon" src={openZimLogo} alt="" aria-hidden="true" />
             </button>
           </header>
 
@@ -2384,7 +3275,11 @@ function App() {
                   onClick={() => void startZimitCapture()}
                   disabled={isZimitStarting}
                 >
-                  {isZimitStarting ? <Loader2 className="spin" size={16} /> : <Download size={16} />}
+                  {isZimitStarting ? (
+                    <Loader2 className="spin" size={16} />
+                  ) : (
+                    <img className="openzim-logo-icon small" src={openZimLogo} alt="" aria-hidden="true" />
+                  )}
                   Start
                 </button>
               </div>
@@ -2438,15 +3333,7 @@ function App() {
                   <FolderOpen size={16} />
                   Folder
                 </button>
-                <label className="field zimit-wide">
-                  <span>Scope exclude regex, one per line</span>
-                  <textarea
-                    value={zimitScopeExclude}
-                    onChange={(event) => setZimitScopeExclude(event.target.value)}
-                    rows={2}
-                    placeholder="\\?q=&#10;/login"
-                  />
-                </label>
+                {renderZimitScopeExcludeInput("zimit-wide")}
                 <label className="field zimit-wide">
                   <span>Advanced Zimit / Browsertrix / warc2zim args</span>
                   <input
@@ -2486,6 +3373,7 @@ function App() {
                         <small>{getDownloadTaskDetail(task)}</small>
                         {task.logs?.at(-1) && <small>{task.logs.at(-1)}</small>}
                         {task.error && <small>{task.error}</small>}
+                        {renderDownloadProgress(task)}
                       </div>
                       {task.status === "downloading" ? (
                         <button
@@ -2594,7 +3482,7 @@ function App() {
           <header className="chat-header">
             <div>
               <p className="eyebrow">Knowledge sources</p>
-              <h2>Search and prepare sources</h2>
+              <h2>Create and prepare sources</h2>
             </div>
           </header>
 
@@ -2836,6 +3724,7 @@ function App() {
                 {vectorSetupMode === "database" ? "Build vector database" : "Create collection"}
               </button>
 
+              {renderVectorProgress()}
               {vectorStatus && <p className="vector-status">{vectorStatus}</p>}
             </aside>
           </div>

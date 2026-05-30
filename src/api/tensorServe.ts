@@ -211,7 +211,9 @@ declare global {
         count?: number;
       }) => Promise<KiwixCatalogResponse>;
       downloadZim?: (request: {
+        taskId?: string;
         downloadUrl: string;
+        title?: string;
         name: string;
         sizeBytes?: number;
         downloadDir?: string;
@@ -429,7 +431,9 @@ export async function downloadZim(entry: KiwixCatalogEntry, downloadDir?: string
   }
 
   return window.tensorDesktop.downloadZim({
+    taskId: entry.id,
     downloadUrl: entry.downloadUrl,
+    title: entry.title,
     name: entry.name,
     sizeBytes: entry.sizeBytes,
     downloadDir: downloadDir?.trim() || undefined,

@@ -84,6 +84,7 @@ Download rows show status, file path or source URL, and progress details when av
 TSRC builds on work from the open knowledge and offline web ecosystem:
 
 - [openZIM](https://openzim.org/) for the ZIM file format and tooling.
+- The OpenZIM logo is by Manuel Schneider and is used from [Wikimedia Commons](https://commons.wikimedia.org/wiki/File:OpenZIM-Logo.svg) under [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/). The SVG asset is unmodified.
 - [Kiwix](https://www.kiwix.org/) for offline knowledge access and the public ZIM catalog.
 - [openzim/zimit](https://github.com/openzim/zimit) for website-to-ZIM capture. Zimit uses Browsertrix Crawler to crawl websites and warc2zim to produce ZIM archives.
 - [tensor-serve](https://github.com/3M1RY33T/tensor-serve) for local AI, ingestion, and vector database workflows.

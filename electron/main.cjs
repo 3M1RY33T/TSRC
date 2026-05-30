@@ -3,13 +3,15 @@ const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const { mkdir } = require("node:fs/promises");
 const path = require("node:path");
-const { Readable } = require("node:stream");
+const { Readable, Transform } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
 
 const isDev = !app.isPackaged;
 const devServerUrl = process.env.VITE_DEV_SERVER_URL ?? "http://127.0.0.1:5173";
 let tensorServeProcess = null;
 let tensorServeExit = null;
+let tensorServeShutdownPromise = null;
+let isQuittingAfterTensorServeShutdown = false;
 const tensorServeLogs = [];
 let mainWindow = null;
 let browserView = null;
@@ -21,6 +23,7 @@ const browserState = {
   canGoForward: false,
 };
 const nativeDownloadTasks = new Map();
+const kiwixDownloadTasks = new Map();
 const zimitTasks = new Map();
 const zimitProcesses = new Map();
 const downloadSessions = new WeakSet();
@@ -42,6 +45,10 @@ function getTensorServeStatus() {
     exitCode: tensorServeExit,
     logs: tensorServeLogs.slice(-12),
   };
+}
+
+function isHostedTensorServeRunning() {
+  return Boolean(tensorServeProcess && tensorServeExit === null);
 }
 
 function sleep(ms) {
@@ -66,6 +73,7 @@ function sendDownloadState() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.webContents.send("downloads:state", [
     ...nativeDownloadTasks.values(),
+    ...kiwixDownloadTasks.values(),
     ...zimitTasks.values(),
   ]);
 }
@@ -164,6 +172,13 @@ function updateZimitTask(id, patch) {
   const existing = zimitTasks.get(id);
   if (!existing) return;
   zimitTasks.set(id, { ...existing, ...patch });
+  sendDownloadState();
+}
+
+function updateKiwixDownloadTask(id, patch) {
+  const existing = kiwixDownloadTasks.get(id);
+  if (!existing) return;
+  kiwixDownloadTasks.set(id, { ...existing, ...patch });
   sendDownloadState();
 }
 
@@ -305,7 +320,7 @@ function createBrowserView() {
 }
 
 async function stopHostedTensorServe() {
-  if (!tensorServeProcess || tensorServeExit !== null) {
+  if (!isHostedTensorServeRunning()) {
     return getTensorServeStatus();
   }
 
@@ -345,6 +360,20 @@ async function stopHostedTensorServe() {
   }
 
   return getTensorServeStatus();
+}
+
+function stopHostedTensorServeOnce() {
+  if (!isHostedTensorServeRunning()) {
+    return Promise.resolve(getTensorServeStatus());
+  }
+
+  if (!tensorServeShutdownPromise) {
+    tensorServeShutdownPromise = stopHostedTensorServe().finally(() => {
+      tensorServeShutdownPromise = null;
+    });
+  }
+
+  return tensorServeShutdownPromise;
 }
 
 function createWindow() {
@@ -482,7 +511,7 @@ ipcMain.handle("browser-view:open-external", async (_event, url) => {
 });
 
 ipcMain.handle("downloads:list-native", async () => {
-  return [...nativeDownloadTasks.values(), ...zimitTasks.values()];
+  return [...nativeDownloadTasks.values(), ...kiwixDownloadTasks.values(), ...zimitTasks.values()];
 });
 
 ipcMain.handle("zimit:start", async (_event, request = {}) => {
@@ -663,7 +692,7 @@ ipcMain.handle("tensor-serve:start", async (_event, request) => {
 });
 
 ipcMain.handle("tensor-serve:stop", async () => {
-  return stopHostedTensorServe();
+  return stopHostedTensorServeOnce();
 });
 
 const KIWIX_CATALOG_BASE = "https://opds.library.kiwix.org";
@@ -759,6 +788,7 @@ ipcMain.handle("kiwix:download-zim", async (_event, request) => {
   const requestedDownloadDir = String(request.downloadDir ?? "").trim();
   const downloadDir = requestedDownloadDir || app.getPath("downloads");
   const destination = path.join(downloadDir, fileName);
+  const taskId = String(request.taskId ?? `kiwix:${sourceUrl}`);
 
   await mkdir(downloadDir, { recursive: true });
 
@@ -767,12 +797,57 @@ ipcMain.handle("kiwix:download-zim", async (_event, request) => {
     throw new Error(`Download failed with ${response.status} ${response.statusText}`);
   }
 
-  await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(destination));
+  const totalBytes = Number(response.headers.get("content-length") ?? request.sizeBytes ?? 0);
+  let receivedBytes = 0;
+  let lastProgressAt = 0;
+
+  kiwixDownloadTasks.set(taskId, {
+    id: taskId,
+    title: String(request.title ?? request.name ?? fileName),
+    fileName,
+    path: destination,
+    status: "downloading",
+    sourceUrl,
+    receivedBytes,
+    totalBytes,
+  });
+  sendDownloadState();
+
+  const progressStream = new Transform({
+    transform(chunk, _encoding, callback) {
+      receivedBytes += chunk.length;
+      const now = Date.now();
+      if (now - lastProgressAt > 250 || (totalBytes && receivedBytes >= totalBytes)) {
+        lastProgressAt = now;
+        updateKiwixDownloadTask(taskId, { receivedBytes, totalBytes });
+      }
+      callback(null, chunk);
+    },
+  });
+
+  try {
+    await pipeline(Readable.fromWeb(response.body), progressStream, fs.createWriteStream(destination));
+  } catch (error) {
+    updateKiwixDownloadTask(taskId, {
+      status: "failed",
+      error: error instanceof Error ? error.message : "Download failed.",
+      receivedBytes,
+      totalBytes,
+    });
+    throw error;
+  }
+
+  updateKiwixDownloadTask(taskId, {
+    status: "ready",
+    receivedBytes: totalBytes || receivedBytes,
+    totalBytes: totalBytes || receivedBytes,
+    path: destination,
+  });
 
   return {
     path: destination,
     fileName,
-    sizeBytes: Number(response.headers.get("content-length") ?? request.sizeBytes ?? 0),
+    sizeBytes: totalBytes || receivedBytes,
     sourceUrl,
   };
 });
@@ -996,9 +1071,20 @@ app.whenReady().then(() => {
   });
 });
 
+app.on("before-quit", (event) => {
+  if (isQuittingAfterTensorServeShutdown || !isHostedTensorServeRunning()) return;
+
+  event.preventDefault();
+  isQuittingAfterTensorServeShutdown = true;
+
+  void stopHostedTensorServeOnce().finally(() => {
+    app.quit();
+  });
+});
+
 app.on("window-all-closed", () => {
-  if (tensorServeProcess && tensorServeExit === null) {
-    void stopHostedTensorServe();
+  if (isHostedTensorServeRunning()) {
+    void stopHostedTensorServeOnce();
   }
 
   if (process.platform !== "darwin") {
